@@ -15,11 +15,6 @@ QIT enhances the representational capacity of transformers by leveraging quantum
 ### ⚠️ Research Status Warning
 **This implementation is currently in the research phase and has not been thoroughly tested.** The code is provided primarily for research purposes and exploratory experimentation. We do not recommend using it in production environments or critical applications without extensive validation.
 
-Key points to consider:
-- The theoretical concepts are under active development
-- Performance characteristics have not been thoroughly benchmarked
-- Implementation details may change significantly as research progresses
-
 We welcome other researchers to join this exploration and contribute to the development of quantum-inspired neural network architectures.
 
 ### Features
@@ -53,10 +48,6 @@ QIT는 양자 영감 이중 상태 관리를 활용하여 트랜스포머의 표
 ### ⚠️ 연구 상태 경고
 **이 구현은 현재 연구 단계에 있으며 철저히 테스트되지 않았습니다.** 이 코드는 주로 연구 목적과 탐색적 실험을 위해 제공됩니다. 광범위한 검증 없이 프로덕션 환경이나 중요한 애플리케이션에서 사용하는 것은 권장하지 않습니다.
 
-고려해야 할 주요 사항:
-- 이론적 개념은 활발히 개발 중입니다
-- 성능 특성은 철저히 벤치마크되지 않았습니다
-- 연구가 진행됨에 따라 구현 세부 사항이 크게 변경될 수 있습니다
 
 다른 분들이 이 연구에 참여하여 양자 영감 신경망 아키텍처의 개발에 기여해 주셔도 좋습니다.
 
