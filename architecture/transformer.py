@@ -3,13 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import copy
-from typing import Optional, List, Dict, Tuple, Union
+from typing import Optional, List, Dict, Tuple, Union, Any
 
 from ..core.dual_state import DualStateRepresentation, DualStateController
 from ..core.state_management import GlobalStateManager, HierarchicalStateProtocol
 from ..core.collapse import StateCollapseFramework, DynamicCollapseController, CollapseGate
 from ..core.inference_engine import InferenceEngine, ReasoningDepthAdapter, MultiHypothesisTracker
 from .attention import QuantumInspiredAttention
+from .position_encoding import PositionalEncoding, QuantumPositionalEncoding
+from .feed_forward import FeedForward, DualStateFeedForward
+from .integrated_layer import IntegratedTransformerLayer, IntegratedDecoderLayer
 
 
 class QuantumInspiredTransformerEncoder(nn.Module):
@@ -58,9 +61,17 @@ class QuantumInspiredTransformerEncoder(nn.Module):
         # 이중 상태 컨트롤러
         self.state_controller = DualStateController(hidden_dim=d_model)
         
+        # 위치 인코딩
+        self.position_encoding = PositionalEncoding(d_model=d_model, dropout=dropout)
+        self.quantum_position_encoding = QuantumPositionalEncoding(
+            d_model=d_model, 
+            max_superposition_dim=max_superposition_dim, 
+            dropout=dropout
+        )
+        
         # 인코더 레이어
         self.layers = nn.ModuleList([
-            QuantumInspiredEncoderLayer(
+            IntegratedTransformerLayer(
                 d_model=d_model,
                 nhead=nhead,
                 dim_feedforward=dim_feedforward,
@@ -131,7 +142,10 @@ class QuantumInspiredTransformerEncoder(nn.Module):
         context: Optional[torch.Tensor] = None,
         return_all_states: bool = False,
         force_collapse: bool = False,
-        p_target: float = 0.5  # 목표 전환 확률 추가
+        p_target: float = 0.5,  # 목표 전환 확률 추가
+        superposition_degree: Optional[float] = None,
+        collapse_threshold: Optional[float] = None,
+        interference_strength: Optional[float] = None
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         양자 영감 트랜스포머 인코더 순전파
@@ -144,21 +158,36 @@ class QuantumInspiredTransformerEncoder(nn.Module):
             return_all_states (bool): 모든 상태 반환 여부
             force_collapse (bool): 강제 상태 붕괴 여부
             p_target (float): 목표 전환 확률
+            superposition_degree (float, optional): 중첩 정도 (0~1)
+            collapse_threshold (float, optional): 붕괴 임계값 (0~1)
+            interference_strength (float, optional): 간섭 강도 (0~1)
             
         Returns:
             Union[torch.Tensor, Dict[str, torch.Tensor]]: 인코딩 결과
         """
         batch_size, seq_len, _ = src.shape
         
+        # 위치 인코딩 적용
+        src = self.position_encoding(src)
+        
         # 컨텍스트가 없는 경우 초기 컨텍스트 생성
         if context is None:
             context = src.mean(dim=1)  # [batch_size, d_model]
             
         # 이중 상태 컨트롤러로 중첩 파라미터 계산
-        superposition_degree, collapse_threshold, interference_strength = self.state_controller(context)
+        if any(param is None for param in [superposition_degree, collapse_threshold, interference_strength]):
+            controller_params = self.state_controller(context)
+            if superposition_degree is None:
+                superposition_degree = controller_params['superposition_degree']
+            if collapse_threshold is None:
+                collapse_threshold = controller_params['collapse_threshold']
+            if interference_strength is None:
+                interference_strength = controller_params['interference_strength']
         
         # 초기 상태를 이중 상태로 변환
         superposition_state = self.dual_state_system.to_superposition_state(src, context)
+        # 양자 위치 인코딩 적용
+        superposition_state = self.quantum_position_encoding(superposition_state, is_superposition=True)
         deterministic_state = src
         
         # 레이어별 상태 저장
@@ -169,7 +198,7 @@ class QuantumInspiredTransformerEncoder(nn.Module):
         previous_state = superposition_state.clone()
         hidden_state = torch.zeros(batch_size, seq_len, self.d_model, device=src.device)
         
-        # 레이어별 불확실성, 전환 확률, 리소스 효율성 저장
+        # 불확실성, 전환 확률, 리소스 효율성 추적
         uncertainties = []
         transition_probs = []
         resource_efficiencies = []
@@ -357,9 +386,17 @@ class QuantumInspiredTransformerDecoder(nn.Module):
         # 이중 상태 컨트롤러
         self.state_controller = DualStateController(hidden_dim=d_model)
         
+        # 위치 인코딩
+        self.position_encoding = PositionalEncoding(d_model=d_model, dropout=dropout)
+        self.quantum_position_encoding = QuantumPositionalEncoding(
+            d_model=d_model, 
+            max_superposition_dim=max_superposition_dim, 
+            dropout=dropout
+        )
+        
         # 디코더 레이어
         self.layers = nn.ModuleList([
-            QuantumInspiredDecoderLayer(
+            IntegratedDecoderLayer(
                 d_model=d_model,
                 nhead=nhead,
                 dim_feedforward=dim_feedforward,
@@ -426,7 +463,10 @@ class QuantumInspiredTransformerDecoder(nn.Module):
         memory_superposition: Optional[torch.Tensor] = None,
         return_all_states: bool = False,
         force_collapse: bool = False,
-        p_target: float = 0.5  # 목표 전환 확률 추가
+        p_target: float = 0.5,  # 목표 전환 확률 추가
+        superposition_degree: Optional[float] = None,
+        collapse_threshold: Optional[float] = None,
+        interference_strength: Optional[float] = None
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         양자 영감 트랜스포머 디코더 순전파
@@ -443,11 +483,17 @@ class QuantumInspiredTransformerDecoder(nn.Module):
             return_all_states (bool): 모든 상태 반환 여부
             force_collapse (bool): 강제 상태 붕괴 여부
             p_target (float): 목표 전환 확률
+            superposition_degree (float, optional): 중첩 정도 (0~1)
+            collapse_threshold (float, optional): 붕괴 임계값 (0~1)
+            interference_strength (float, optional): 간섭 강도 (0~1)
             
         Returns:
             Union[torch.Tensor, Dict[str, torch.Tensor]]: 디코딩 결과
         """
         batch_size, seq_len, _ = tgt.shape
+        
+        # 위치 인코딩 적용
+        tgt = self.position_encoding(tgt)
         
         # 컨텍스트가 없는 경우 메모리와 타겟에서 생성
         if context is None:
@@ -456,10 +502,19 @@ class QuantumInspiredTransformerDecoder(nn.Module):
             context = (memory_context + tgt_context) / 2
             
         # 이중 상태 컨트롤러로 중첩 파라미터 계산
-        superposition_degree, collapse_threshold, interference_strength = self.state_controller(context)
+        if any(param is None for param in [superposition_degree, collapse_threshold, interference_strength]):
+            controller_params = self.state_controller(context)
+            if superposition_degree is None:
+                superposition_degree = controller_params['superposition_degree']
+            if collapse_threshold is None:
+                collapse_threshold = controller_params['collapse_threshold']
+            if interference_strength is None:
+                interference_strength = controller_params['interference_strength']
         
         # 초기 상태를 이중 상태로 변환
         superposition_state = self.dual_state_system.to_superposition_state(tgt, context)
+        # 양자 위치 인코딩 적용
+        superposition_state = self.quantum_position_encoding(superposition_state, is_superposition=True)
         deterministic_state = tgt
         
         # 레이어별 상태 저장
@@ -606,566 +661,6 @@ class QuantumInspiredTransformerDecoder(nn.Module):
             return output
 
 
-class QuantumInspiredEncoderLayer(nn.Module):
-    """
-    양자 영감 트랜스포머 인코더 레이어
-    """
-    
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        dim_feedforward: int = 2048,
-        dropout: float = 0.1,
-        max_superposition_dim: int = 4,
-        activation: str = "gelu",
-        layer_id: int = 0,  # 레이어 ID 추가
-        num_layers: int = 12,  # 총 레이어 수 추가
-        gate_type: str = "mlp"  # CollapseGate 유형 추가
-    ):
-        """
-        양자 영감 인코더 레이어 초기화
-        
-        Args:
-            d_model (int): 모델 차원
-            nhead (int): 어텐션 헤드 수
-            dim_feedforward (int): 피드포워드 네트워크 차원
-            dropout (float): 드롭아웃 비율
-            max_superposition_dim (int): 최대 중첩 상태 차원
-            activation (str): 활성화 함수 유형
-            layer_id (int): 현재 레이어 ID
-            num_layers (int): 총 레이어 수
-            gate_type (str): CollapseGate 유형
-        """
-        super().__init__()
-        
-        self.layer_id = layer_id
-        self.num_layers = num_layers
-        
-        # 양자 영감 멀티헤드 어텐션
-        self.self_attn = QuantumInspiredAttention(
-            d_model=d_model,
-            nhead=nhead,
-            max_superposition_dim=max_superposition_dim,
-            dropout=dropout
-        )
-        
-        # 피드포워드 네트워크 (확정 상태용)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        
-        # 피드포워드 네트워크 (중첩 상태용)
-        self.superposition_linear1 = nn.Linear(
-            d_model * max_superposition_dim, 
-            dim_feedforward * max_superposition_dim
-        )
-        self.superposition_linear2 = nn.Linear(
-            dim_feedforward * max_superposition_dim, 
-            d_model * max_superposition_dim
-        )
-        
-        # 정규화 레이어
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.superposition_norm1 = nn.LayerNorm(d_model * max_superposition_dim)
-        self.superposition_norm2 = nn.LayerNorm(d_model * max_superposition_dim)
-        
-        # 활성화 함수
-        self.activation = self._get_activation_fn(activation)
-        
-        # 이중 상태 표현 시스템
-        self.dual_state_system = DualStateRepresentation(
-            hidden_dim=d_model,
-            max_superposition_dim=max_superposition_dim
-        )
-        
-        # CollapseGate 추가
-        self.collapse_gate = CollapseGate(
-            hidden_dim=d_model,
-            max_superposition_dim=max_superposition_dim,
-            layer_id=layer_id,
-            num_layers=num_layers,
-            gate_type=gate_type
-        )
-        
-    def _get_activation_fn(self, activation):
-        """
-        활성화 함수 반환
-        
-        Args:
-            activation (str): 활성화 함수 유형
-            
-        Returns:
-            function: 활성화 함수
-        """
-        if activation == "relu":
-            return F.relu
-        elif activation == "gelu":
-            return F.gelu
-        else:
-            raise ValueError(f"Unsupported activation: {activation}")
-            
-    def forward_deterministic(
-        self,
-        src: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None,
-        src_key_padding_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        확정 상태 순전파
-        
-        Args:
-            src (torch.Tensor): 입력 텐서
-            src_mask (torch.Tensor, optional): 어텐션 마스크
-            src_key_padding_mask (torch.Tensor, optional): 패딩 마스크
-            
-        Returns:
-            torch.Tensor: 처리된 확정 상태
-        """
-        # 셀프 어텐션 (확정 상태)
-        src2 = self.self_attn(
-            q=src, 
-            k=src, 
-            v=src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask
-        )
-        
-        # 첫 번째 잔여 연결
-        src = src + src2
-        src = self.norm1(src)
-        
-        # 피드포워드 네트워크
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        
-        # 두 번째 잔여 연결
-        src = src + self.dropout(src2)
-        src = self.norm2(src)
-        
-        return src
-    
-    def forward_superposition(
-        self,
-        src: torch.Tensor,
-        src_mask: Optional[torch.Tensor] = None,
-        src_key_padding_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        중첩 상태 순전파
-        
-        Args:
-            src (torch.Tensor): 입력 중첩 상태 텐서
-            src_mask (torch.Tensor, optional): 어텐션 마스크
-            src_key_padding_mask (torch.Tensor, optional): 패딩 마스크
-            
-        Returns:
-            torch.Tensor: 처리된 중첩 상태
-        """
-        # 셀프 어텐션 (중첩 상태)
-        src2 = self.self_attn(
-            q=src, 
-            k=src, 
-            v=src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask,
-            is_superposition=True
-        )
-        
-        # 첫 번째 잔여 연결
-        src = src + src2
-        src = self.superposition_norm1(src)
-        
-        # 중첩 상태용 피드포워드 네트워크
-        src2 = self.superposition_linear2(
-            self.dropout(self.activation(self.superposition_linear1(src)))
-        )
-        
-        # 두 번째 잔여 연결
-        src = src + self.dropout(src2)
-        src = self.superposition_norm2(src)
-        
-        return src
-    
-    def forward(
-        self,
-        deterministic_state: torch.Tensor,
-        superposition_state: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        src_key_padding_mask: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        superposition_degree: Optional[torch.Tensor] = None,
-        collapse_threshold: Optional[torch.Tensor] = None,
-        interference_strength: Optional[torch.Tensor] = None,
-        p_target: float = 0.5  # 목표 전환 확률 추가
-    ) -> Dict[str, torch.Tensor]:
-        """
-        인코더 레이어 순전파
-        
-        Args:
-            deterministic_state (torch.Tensor): 확정 상태 입력
-            superposition_state (torch.Tensor): 중첩 상태 입력
-            mask (torch.Tensor, optional): 어텐션 마스크
-            src_key_padding_mask (torch.Tensor, optional): 패딩 마스크
-            context (torch.Tensor, optional): 컨텍스트 정보
-            superposition_degree (torch.Tensor, optional): 중첩 정도
-            collapse_threshold (torch.Tensor, optional): 붕괴 임계값
-            interference_strength (torch.Tensor, optional): 간섭 강도
-            p_target (float): 목표 전환 확률
-            
-        Returns:
-            Dict[str, torch.Tensor]: 인코더 레이어 결과
-        """
-        # 확정 상태 처리
-        deterministic_output = self.forward_deterministic(
-            src=deterministic_state,
-            src_mask=mask,
-            src_key_padding_mask=src_key_padding_mask
-        )
-        
-        # 중첩 상태 처리
-        superposition_output = self.forward_superposition(
-            src=superposition_state,
-            src_mask=mask,
-            src_key_padding_mask=src_key_padding_mask
-        )
-        
-        # 상태 간 간섭 적용
-        superposition_output = self.dual_state_system.compute_interference(superposition_output)
-        
-        # CollapseGate 적용
-        gate_result = self.collapse_gate(
-            deterministic_state=deterministic_output,
-            superposition_state=superposition_output,
-            context=context,
-            p_target=p_target
-        )
-        
-        # 최종 결과 반환
-        return {
-            'deterministic_state': gate_result['deterministic_state'],
-            'superposition_state': gate_result['superposition_state'],
-            'uncertainty': gate_result['uncertainty'],
-            'transition_prob': gate_result['transition_prob'],
-            'resource_efficiency': gate_result['resource_efficiency']
-        }
-
-
-class QuantumInspiredDecoderLayer(nn.Module):
-    """
-    양자 영감 트랜스포머 디코더 레이어
-    """
-    
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        dim_feedforward: int = 2048,
-        dropout: float = 0.1,
-        max_superposition_dim: int = 4,
-        activation: str = "gelu",
-        layer_id: int = 0,  # 레이어 ID 추가
-        num_layers: int = 12,  # 총 레이어 수 추가
-        gate_type: str = "mlp"  # CollapseGate 유형 추가
-    ):
-        """
-        양자 영감 디코더 레이어 초기화
-        
-        Args:
-            d_model (int): 모델 차원
-            nhead (int): 어텐션 헤드 수
-            dim_feedforward (int): 피드포워드 네트워크 차원
-            dropout (float): 드롭아웃 비율
-            max_superposition_dim (int): 최대 중첩 상태 차원
-            activation (str): 활성화 함수 유형
-            layer_id (int): 현재 레이어 ID
-            num_layers (int): 총 레이어 수
-            gate_type (str): CollapseGate 유형
-        """
-        super().__init__()
-        
-        self.layer_id = layer_id
-        self.num_layers = num_layers
-        
-        # 양자 영감 멀티헤드 어텐션 (셀프 어텐션)
-        self.self_attn = QuantumInspiredAttention(
-            d_model=d_model,
-            nhead=nhead,
-            max_superposition_dim=max_superposition_dim,
-            dropout=dropout
-        )
-        
-        # 양자 영감 멀티헤드 어텐션 (크로스 어텐션)
-        self.multihead_attn = QuantumInspiredAttention(
-            d_model=d_model,
-            nhead=nhead,
-            max_superposition_dim=max_superposition_dim,
-            dropout=dropout
-        )
-        
-        # 피드포워드 네트워크 (확정 상태용)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        
-        # 피드포워드 네트워크 (중첩 상태용)
-        self.superposition_linear1 = nn.Linear(
-            d_model * max_superposition_dim, 
-            dim_feedforward * max_superposition_dim
-        )
-        self.superposition_linear2 = nn.Linear(
-            dim_feedforward * max_superposition_dim, 
-            d_model * max_superposition_dim
-        )
-        
-        # 정규화 레이어
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.superposition_norm1 = nn.LayerNorm(d_model * max_superposition_dim)
-        self.superposition_norm2 = nn.LayerNorm(d_model * max_superposition_dim)
-        self.superposition_norm3 = nn.LayerNorm(d_model * max_superposition_dim)
-        
-        # 활성화 함수
-        self.activation = self._get_activation_fn(activation)
-        
-        # 이중 상태 표현 시스템
-        self.dual_state_system = DualStateRepresentation(
-            hidden_dim=d_model,
-            max_superposition_dim=max_superposition_dim
-        )
-        
-        # CollapseGate 추가
-        self.collapse_gate = CollapseGate(
-            hidden_dim=d_model,
-            max_superposition_dim=max_superposition_dim,
-            layer_id=layer_id,
-            num_layers=num_layers,
-            gate_type=gate_type
-        )
-        
-    def _get_activation_fn(self, activation):
-        """
-        활성화 함수 반환
-        
-        Args:
-            activation (str): 활성화 함수 유형
-            
-        Returns:
-            function: 활성화 함수
-        """
-        if activation == "relu":
-            return F.relu
-        elif activation == "gelu":
-            return F.gelu
-        else:
-            raise ValueError(f"Unsupported activation: {activation}")
-            
-    def forward_deterministic(
-        self,
-        tgt: torch.Tensor,
-        memory: torch.Tensor,
-        tgt_mask: Optional[torch.Tensor] = None,
-        memory_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        memory_key_padding_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        확정 상태 순전파
-        
-        Args:
-            tgt (torch.Tensor): 타겟 텐서
-            memory (torch.Tensor): 메모리 텐서
-            tgt_mask (torch.Tensor, optional): 타겟 어텐션 마스크
-            memory_mask (torch.Tensor, optional): 메모리 어텐션 마스크
-            tgt_key_padding_mask (torch.Tensor, optional): 타겟 패딩 마스크
-            memory_key_padding_mask (torch.Tensor, optional): 메모리 패딩 마스크
-            
-        Returns:
-            torch.Tensor: 처리된 확정 상태
-        """
-        # 셀프 어텐션 (확정 상태)
-        tgt2 = self.self_attn(
-            q=tgt, 
-            k=tgt, 
-            v=tgt,
-            attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_padding_mask
-        )
-        
-        # 첫 번째 잔여 연결
-        tgt = tgt + tgt2
-        tgt = self.norm1(tgt)
-        
-        # 크로스 어텐션
-        tgt2 = self.multihead_attn(
-            q=tgt,
-            k=memory,
-            v=memory,
-            attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask
-        )
-        
-        # 두 번째 잔여 연결
-        tgt = tgt + tgt2
-        tgt = self.norm2(tgt)
-        
-        # 피드포워드 네트워크
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-        
-        # 세 번째 잔여 연결
-        tgt = tgt + self.dropout(tgt2)
-        tgt = self.norm3(tgt)
-        
-        return tgt
-    
-    def forward_superposition(
-        self,
-        tgt: torch.Tensor,
-        memory: torch.Tensor,
-        tgt_mask: Optional[torch.Tensor] = None,
-        memory_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        memory_key_padding_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        중첩 상태 순전파
-        
-        Args:
-            tgt (torch.Tensor): 타겟 중첩 상태 텐서
-            memory (torch.Tensor): 메모리 중첩 상태 텐서
-            tgt_mask (torch.Tensor, optional): 타겟 어텐션 마스크
-            memory_mask (torch.Tensor, optional): 메모리 어텐션 마스크
-            tgt_key_padding_mask (torch.Tensor, optional): 타겟 패딩 마스크
-            memory_key_padding_mask (torch.Tensor, optional): 메모리 패딩 마스크
-            
-        Returns:
-            torch.Tensor: 처리된 중첩 상태
-        """
-        # 셀프 어텐션 (중첩 상태)
-        tgt2 = self.self_attn(
-            q=tgt, 
-            k=tgt, 
-            v=tgt,
-            attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_padding_mask,
-            is_superposition=True
-        )
-        
-        # 첫 번째 잔여 연결
-        tgt = tgt + tgt2
-        tgt = self.superposition_norm1(tgt)
-        
-        # 크로스 어텐션 (중첩 상태)
-        tgt2 = self.multihead_attn(
-            q=tgt,
-            k=memory,
-            v=memory,
-            attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask,
-            is_superposition=True
-        )
-        
-        # 두 번째 잔여 연결
-        tgt = tgt + tgt2
-        tgt = self.superposition_norm2(tgt)
-        
-        # 중첩 상태용 피드포워드 네트워크
-        tgt2 = self.superposition_linear2(
-            self.dropout(self.activation(self.superposition_linear1(tgt)))
-        )
-        
-        # 세 번째 잔여 연결
-        tgt = tgt + self.dropout(tgt2)
-        tgt = self.superposition_norm3(tgt)
-        
-        return tgt
-    
-    def forward(
-        self,
-        deterministic_state: torch.Tensor,
-        superposition_state: torch.Tensor,
-        memory: torch.Tensor,
-        memory_superposition: Optional[torch.Tensor] = None,
-        tgt_mask: Optional[torch.Tensor] = None,
-        memory_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None,
-        memory_key_padding_mask: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        superposition_degree: Optional[torch.Tensor] = None,
-        collapse_threshold: Optional[torch.Tensor] = None,
-        interference_strength: Optional[torch.Tensor] = None,
-        p_target: float = 0.5  # 목표 전환 확률 추가
-    ) -> Dict[str, torch.Tensor]:
-        """
-        디코더 레이어 순전파
-        
-        Args:
-            deterministic_state (torch.Tensor): 확정 상태 입력
-            superposition_state (torch.Tensor): 중첩 상태 입력
-            memory (torch.Tensor): 메모리 확정 상태
-            memory_superposition (torch.Tensor, optional): 메모리 중첩 상태
-            tgt_mask (torch.Tensor, optional): 타겟 어텐션 마스크
-            memory_mask (torch.Tensor, optional): 메모리 어텐션 마스크
-            tgt_key_padding_mask (torch.Tensor, optional): 타겟 패딩 마스크
-            memory_key_padding_mask (torch.Tensor, optional): 메모리 패딩 마스크
-            context (torch.Tensor, optional): 컨텍스트 정보
-            superposition_degree (torch.Tensor, optional): 중첩 정도
-            collapse_threshold (torch.Tensor, optional): 붕괴 임계값
-            interference_strength (torch.Tensor, optional): 간섭 강도
-            p_target (float): 목표 전환 확률
-            
-        Returns:
-            Dict[str, torch.Tensor]: 디코더 레이어 결과
-        """
-        # 확정 상태 처리
-        deterministic_output = self.forward_deterministic(
-            tgt=deterministic_state,
-            memory=memory,
-            tgt_mask=tgt_mask,
-            memory_mask=memory_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask
-        )
-        
-        # 메모리 중첩 상태가 없는 경우 확정 상태에서 생성
-        if memory_superposition is None:
-            batch_size, src_len, _ = memory.shape
-            memory_superposition = self.dual_state_system.to_superposition_state(
-                memory, context if context is not None else memory.mean(dim=1)
-            )
-        
-        # 중첩 상태 처리
-        superposition_output = self.forward_superposition(
-            tgt=superposition_state,
-            memory=memory_superposition,
-            tgt_mask=tgt_mask,
-            memory_mask=memory_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask
-        )
-        
-        # 상태 간 간섭 적용
-        superposition_output = self.dual_state_system.compute_interference(superposition_output)
-        
-        # CollapseGate 적용
-        gate_result = self.collapse_gate(
-            deterministic_state=deterministic_output,
-            superposition_state=superposition_output,
-            context=context,
-            p_target=p_target
-        )
-        
-        # 최종 결과 반환
-        return {
-            'deterministic_state': gate_result['deterministic_state'],
-            'superposition_state': gate_result['superposition_state'],
-            'uncertainty': gate_result['uncertainty'],
-            'transition_prob': gate_result['transition_prob'],
-            'resource_efficiency': gate_result['resource_efficiency']
-        }
-
-
 class QuantumInspiredTransformer(nn.Module):
     """
     최적화된 하이브리드 양자 영감 트랜스포머 통합 모델
@@ -1183,7 +678,9 @@ class QuantumInspiredTransformer(nn.Module):
         activation: str = "gelu",
         gate_type: str = "mlp",  # CollapseGate 유형 추가
         custom_encoder: Optional[nn.Module] = None,
-        custom_decoder: Optional[nn.Module] = None
+        custom_decoder: Optional[nn.Module] = None,
+        vocab_size: Optional[int] = None,
+        pad_token_id: int = 0
     ):
         """
         양자 영감 트랜스포머 모델 초기화
@@ -1200,6 +697,8 @@ class QuantumInspiredTransformer(nn.Module):
             gate_type (str): CollapseGate 유형
             custom_encoder (nn.Module, optional): 사용자 정의 인코더
             custom_decoder (nn.Module, optional): 사용자 정의 디코더
+            vocab_size (int, optional): 어휘 크기 (임베딩 레이어 사용 시 필요)
+            pad_token_id (int): 패딩 토큰 ID
         """
         super().__init__()
         
@@ -1207,6 +706,13 @@ class QuantumInspiredTransformer(nn.Module):
         self.nhead = nhead
         self.max_superposition_dim = max_superposition_dim
         self.gate_type = gate_type
+        self.pad_token_id = pad_token_id
+        
+        # 입력 임베딩 레이어 (vocab_size가 제공된 경우)
+        self.has_embeddings = vocab_size is not None
+        if self.has_embeddings:
+            self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
+            self.embedding_scale = math.sqrt(d_model)
         
         # 인코더 생성
         if custom_encoder is not None:
@@ -1237,6 +743,12 @@ class QuantumInspiredTransformer(nn.Module):
                 activation=activation,
                 gate_type=gate_type
             )
+        
+        # 출력 선형 레이어 (vocab_size가 제공된 경우)
+        if self.has_embeddings:
+            self.output_projection = nn.Linear(d_model, vocab_size)
+            # 가중치 공유 (임베딩과 출력 프로젝션)
+            self.output_projection.weight = self.embedding.weight
             
         # 초기화
         self._reset_parameters()
@@ -1248,6 +760,95 @@ class QuantumInspiredTransformer(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+    
+    def _prepare_masks(
+        self,
+        src: torch.Tensor,
+        tgt: torch.Tensor,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor]
+    ]:
+        """
+        마스크 준비
+        
+        Args:
+            src: 소스 시퀀스
+            tgt: 타겟 시퀀스
+            src_key_padding_mask: 소스 패딩 마스크
+            tgt_key_padding_mask: 타겟 패딩 마스크
+            
+        Returns:
+            Tuple: (src_mask, tgt_mask, memory_mask, src_key_padding_mask, tgt_key_padding_mask)
+        """
+        # 소스 패딩 마스크가 없는 경우 생성
+        if src_key_padding_mask is None and self.has_embeddings:
+            src_key_padding_mask = (src == self.pad_token_id)
+        
+        # 타겟 패딩 마스크가 없는 경우 생성
+        if tgt_key_padding_mask is None and self.has_embeddings:
+            tgt_key_padding_mask = (tgt == self.pad_token_id)
+        
+        # 소스/메모리 마스크 (일반적으로 None)
+        src_mask = None
+        memory_mask = None
+        
+        # 타겟 마스크 (casual attention)
+        tgt_len = tgt.size(1)
+        tgt_mask = self._generate_square_subsequent_mask(tgt_len).to(tgt.device)
+        
+        return src_mask, tgt_mask, memory_mask, src_key_padding_mask, tgt_key_padding_mask
+    
+    def _generate_square_subsequent_mask(self, sz: int) -> torch.Tensor:
+        """
+        후속 마스크 생성 (디코더 self-attention에서 사용)
+        
+        Args:
+            sz: 시퀀스 길이
+            
+        Returns:
+            torch.Tensor: 후속 마스크
+        """
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+    
+    def _prepare_inputs(
+        self,
+        src: torch.Tensor,
+        tgt: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        입력 준비
+        
+        Args:
+            src: 소스 시퀀스
+            tgt: 타겟 시퀀스
+            
+        Returns:
+            Tuple: (src_emb, tgt_emb)
+        """
+        # 임베딩이 있는 경우 적용
+        if self.has_embeddings:
+            if src.dim() == 2:  # [batch_size, seq_len]
+                src_emb = self.embedding(src) * self.embedding_scale
+            else:  # [batch_size, seq_len, d_model]
+                src_emb = src
+                
+            if tgt.dim() == 2:  # [batch_size, seq_len]
+                tgt_emb = self.embedding(tgt) * self.embedding_scale
+            else:  # [batch_size, seq_len, d_model]
+                tgt_emb = tgt
+        else:
+            src_emb = src
+            tgt_emb = tgt
+            
+        return src_emb, tgt_emb
                 
     def forward(
         self,
@@ -1261,14 +862,18 @@ class QuantumInspiredTransformer(nn.Module):
         memory_key_padding_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         return_all_states: bool = False,
-        p_target: float = 0.5  # 목표 전환 확률 추가
+        force_collapse: bool = False,
+        p_target: float = 0.5,  # 목표 전환 확률 추가
+        superposition_degree: Optional[float] = None,
+        collapse_threshold: Optional[float] = None,
+        interference_strength: Optional[float] = None
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         양자 영감 트랜스포머 순전파
         
         Args:
-            src (torch.Tensor): 소스 시퀀스 [batch_size, src_len, d_model]
-            tgt (torch.Tensor): 타겟 시퀀스 [batch_size, tgt_len, d_model]
+            src (torch.Tensor): 소스 시퀀스 [batch_size, src_len, d_model] 또는 [batch_size, src_len]
+            tgt (torch.Tensor): 타겟 시퀀스 [batch_size, tgt_len, d_model] 또는 [batch_size, tgt_len]
             src_mask (torch.Tensor, optional): 소스 어텐션 마스크
             tgt_mask (torch.Tensor, optional): 타겟 어텐션 마스크
             memory_mask (torch.Tensor, optional): 메모리 어텐션 마스크
@@ -1277,44 +882,70 @@ class QuantumInspiredTransformer(nn.Module):
             memory_key_padding_mask (torch.Tensor, optional): 메모리 패딩 마스크
             context (torch.Tensor, optional): 컨텍스트 정보
             return_all_states (bool): 모든 상태 반환 여부
+            force_collapse (bool): 강제 상태 붕괴 여부
             p_target (float): 목표 전환 확률
+            superposition_degree (float, optional): 중첩 정도 (0~1)
+            collapse_threshold (float, optional): 붕괴 임계값 (0~1)
+            interference_strength (float, optional): 간섭 강도 (0~1)
             
         Returns:
             Union[torch.Tensor, Dict[str, torch.Tensor]]: 트랜스포머 출력
         """
+        # 입력 임베딩 적용
+        src_emb, tgt_emb = self._prepare_inputs(src, tgt)
+        
+        # 마스크 준비
+        if any(mask is None for mask in [src_mask, tgt_mask, src_key_padding_mask, tgt_key_padding_mask]):
+            prepared_masks = self._prepare_masks(src, tgt, src_key_padding_mask, tgt_key_padding_mask)
+            src_mask = prepared_masks[0] if src_mask is None else src_mask
+            tgt_mask = prepared_masks[1] if tgt_mask is None else tgt_mask
+            memory_mask = prepared_masks[2] if memory_mask is None else memory_mask
+            src_key_padding_mask = prepared_masks[3] if src_key_padding_mask is None else src_key_padding_mask
+            tgt_key_padding_mask = prepared_masks[4] if tgt_key_padding_mask is None else tgt_key_padding_mask
+        
+        # memory_key_padding_mask가 없으면 src_key_padding_mask 사용
+        if memory_key_padding_mask is None:
+            memory_key_padding_mask = src_key_padding_mask
+        
         # 컨텍스트 생성
         if context is None:
-            src_context = src.mean(dim=1)  # [batch_size, d_model]
-            tgt_context = tgt.mean(dim=1)  # [batch_size, d_model]
+            src_context = src_emb.mean(dim=1)  # [batch_size, d_model]
+            tgt_context = tgt_emb.mean(dim=1)  # [batch_size, d_model]
             context = (src_context + tgt_context) / 2
             
         # 인코더 순전파
         if return_all_states:
             encoder_output = self.encoder(
-                src=src,
+                src=src_emb,
                 mask=src_mask,
                 src_key_padding_mask=src_key_padding_mask,
                 context=context,
                 return_all_states=True,
                 force_collapse=False,
-                p_target=p_target  # 목표 전환 확률 전달
+                p_target=p_target,  # 목표 전환 확률 전달
+                superposition_degree=superposition_degree,
+                collapse_threshold=collapse_threshold,
+                interference_strength=interference_strength
             )
             memory = encoder_output['output']
             memory_superposition = encoder_output['superposition_state']
         else:
             memory = self.encoder(
-                src=src,
+                src=src_emb,
                 mask=src_mask,
                 src_key_padding_mask=src_key_padding_mask,
                 context=context,
-                p_target=p_target  # 목표 전환 확률 전달
+                p_target=p_target,  # 목표 전환 확률 전달
+                superposition_degree=superposition_degree,
+                collapse_threshold=collapse_threshold,
+                interference_strength=interference_strength
             )
             memory_superposition = None
             
         # 디코더 순전파
         if return_all_states:
             decoder_output = self.decoder(
-                tgt=tgt,
+                tgt=tgt_emb,
                 memory=memory,
                 tgt_mask=tgt_mask,
                 memory_mask=memory_mask,
@@ -1323,13 +954,16 @@ class QuantumInspiredTransformer(nn.Module):
                 context=context,
                 memory_superposition=memory_superposition,
                 return_all_states=True,
-                force_collapse=True,
-                p_target=p_target  # 목표 전환 확률 전달
+                force_collapse=force_collapse,
+                p_target=p_target,  # 목표 전환 확률 전달
+                superposition_degree=superposition_degree,
+                collapse_threshold=collapse_threshold,
+                interference_strength=interference_strength
             )
             output = decoder_output['output']
         else:
             output = self.decoder(
-                tgt=tgt,
+                tgt=tgt_emb,
                 memory=memory,
                 tgt_mask=tgt_mask,
                 memory_mask=memory_mask,
@@ -1337,10 +971,22 @@ class QuantumInspiredTransformer(nn.Module):
                 memory_key_padding_mask=memory_key_padding_mask,
                 context=context,
                 memory_superposition=memory_superposition,
-                p_target=p_target  # 목표 전환 확률 전달
+                p_target=p_target,  # 목표 전환 확률 전달
+                superposition_degree=superposition_degree,
+                collapse_threshold=collapse_threshold,
+                interference_strength=interference_strength
             )
+        
+        # 출력 프로젝션 적용 (vocab_size가 있는 경우)
+        if self.has_embeddings:
+            if return_all_states:
+                decoder_output['logits'] = self.output_projection(output)
+                decoder_output['output'] = output  # 원본 출력도 유지
+                output = decoder_output
+            else:
+                output = self.output_projection(output)
             
-        if return_all_states:
+        if return_all_states and not isinstance(output, dict):
             # 평균 불확실성, 전환 확률, 리소스 효율성 계산
             encoder_uncertainty = encoder_output.get('uncertainty', torch.tensor(0.0))
             decoder_uncertainty = decoder_output.get('uncertainty', torch.tensor(0.0))
@@ -1356,6 +1002,7 @@ class QuantumInspiredTransformer(nn.Module):
             
             return {
                 'output': output,
+                'logits': self.output_projection(output) if self.has_embeddings else None,
                 'encoder_output': encoder_output,
                 'decoder_output': decoder_output,
                 'uncertainty': avg_uncertainty,  # 평균 불확실성 추가

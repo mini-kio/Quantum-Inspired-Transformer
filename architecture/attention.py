@@ -52,11 +52,19 @@ class QuantumInspiredAttention(nn.Module):
         # 진폭 조절 파라미터
         self.amplitude_scaler = nn.Parameter(torch.ones(1))
 
-        # Sparsity control - NEW: added for resource efficiency
+        # Sparsity control - for resource efficiency
         self.sparsity_gate = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Linear(d_model // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        # Superposition sparsity control
+        self.superposition_sparsity_gate = nn.Sequential(
+            nn.Linear(d_model * max_superposition_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, max_superposition_dim),
             nn.Sigmoid()
         )
         
@@ -72,7 +80,7 @@ class QuantumInspiredAttention(nn.Module):
         Returns:
             torch.Tensor: 헤드별로 변환된 중첩 상태 텐서
         """
-        # [batch_size, seq_len, nhead * d_k * max_superposition_dim]로 재구성
+        # [batch_size, seq_len, nhead, d_k, max_superposition_dim]로 재구성
         x = x.view(batch_size, seq_len, self.nhead, self.d_k, self.max_superposition_dim)
         
         # [batch_size, nhead, seq_len, d_k, max_superposition_dim]로 치환
@@ -120,8 +128,9 @@ class QuantumInspiredAttention(nn.Module):
         Returns:
             torch.Tensor: 진폭 가중치
         """
-        # 진폭 제곱은 확률에 비례
-        weights = F.softmax(attention_scores / math.sqrt(self.d_k), dim=-1)
+        # BUG FIX 1: Removed the duplicate scaling by sqrt(d_k)
+        # Only apply softmax, don't scale again
+        weights = F.softmax(attention_scores, dim=-1)
         weights = self.dropout(weights)
         
         return weights
@@ -144,6 +153,9 @@ class QuantumInspiredAttention(nn.Module):
         seq_len_q = q.shape[1]
         seq_len_k = k.shape[1]
         seq_len_v = v.shape[1]
+        
+        # BUG FIX 3: Add validation for key and value sequence lengths
+        assert seq_len_k == seq_len_v, "Key and value sequence lengths must match"
         
         # 선형 변환 적용
         q = self.q_linear(q).view(batch_size, seq_len_q, self.nhead, self.d_k).transpose(1, 2)
@@ -192,6 +204,9 @@ class QuantumInspiredAttention(nn.Module):
         seq_len_q = q.shape[1]
         seq_len_k = k.shape[1]
         seq_len_v = v.shape[1]
+        
+        # BUG FIX 3: Add validation for key and value sequence lengths
+        assert seq_len_k == seq_len_v, "Key and value sequence lengths must match"
         
         # 중첩 상태에 대한 선형 변환
         q = self.superposition_q_linear(q)
@@ -247,7 +262,7 @@ class QuantumInspiredAttention(nn.Module):
         Applies adaptive sparsity to attention weights for resource efficiency
         
         Args:
-            state (torch.Tensor): Input state tensor
+            state (torch.Tensor): Input state tensor [batch_size, seq_len, hidden_dim]
             target_sparsity (float): Target sparsity level (0-1)
             
         Returns:
@@ -260,6 +275,36 @@ class QuantumInspiredAttention(nn.Module):
         
         # Apply mask
         return state * mask
+    
+    # BUG FIX 2: Add a separate method for superposition sparsity
+    def apply_superposition_sparsity(self, state, target_sparsity=0.7):
+        """
+        Applies adaptive sparsity to superposition state
+        
+        Args:
+            state (torch.Tensor): Input superposition state tensor [batch_size, seq_len, hidden_dim * max_superposition_dim]
+            target_sparsity (float): Target sparsity level (0-1)
+            
+        Returns:
+            torch.Tensor: Sparsified superposition state tensor
+        """
+        batch_size, seq_len, _ = state.shape
+        
+        # Calculate dimension-wise sparsity scores
+        sparsity_scores = self.superposition_sparsity_gate(state.mean(dim=1, keepdim=True))
+        
+        # Apply target sparsity by creating a dimension mask
+        threshold = torch.quantile(sparsity_scores, target_sparsity)
+        dim_mask = (sparsity_scores >= threshold).float()
+        
+        # Reshape state for dimension-wise masking
+        reshaped_state = state.view(batch_size, seq_len, self.max_superposition_dim, self.hidden_dim)
+        
+        # Apply mask along dimension axis
+        masked_state = reshaped_state * dim_mask.unsqueeze(1).unsqueeze(-1)
+        
+        # Return to original shape
+        return masked_state.view(batch_size, seq_len, -1)
     
     def forward(self, q, k, v, attn_mask=None, key_padding_mask=None, is_superposition=False, 
                 target_sparsity=None, apply_sparsity=False):
@@ -281,11 +326,15 @@ class QuantumInspiredAttention(nn.Module):
         """
         if is_superposition:
             output = self.forward_superposition(q, k, v, attn_mask, key_padding_mask)
+            
+            # BUG FIX 2: Use the correct sparsity method for superposition state
+            if apply_sparsity and target_sparsity is not None:
+                output = self.apply_superposition_sparsity(output, target_sparsity)
         else:
             output = self.forward_deterministic(q, k, v, attn_mask, key_padding_mask)
             
-        # Apply sparsity if requested
-        if apply_sparsity and target_sparsity is not None:
-            output = self.apply_sparsity(output, target_sparsity)
+            # Apply regular sparsity for deterministic state
+            if apply_sparsity and target_sparsity is not None:
+                output = self.apply_sparsity(output, target_sparsity)
             
         return output
