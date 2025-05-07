@@ -51,6 +51,14 @@ class QuantumInspiredAttention(nn.Module):
         
         # 진폭 조절 파라미터
         self.amplitude_scaler = nn.Parameter(torch.ones(1))
+
+        # Sparsity control - NEW: added for resource efficiency
+        self.sparsity_gate = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+            nn.Sigmoid()
+        )
         
     def _transform_for_superposition(self, x, batch_size, seq_len):
         """
@@ -234,7 +242,27 @@ class QuantumInspiredAttention(nn.Module):
         
         return output
     
-    def forward(self, q, k, v, attn_mask=None, key_padding_mask=None, is_superposition=False):
+    def apply_sparsity(self, state, target_sparsity=0.7):
+        """
+        Applies adaptive sparsity to attention weights for resource efficiency
+        
+        Args:
+            state (torch.Tensor): Input state tensor
+            target_sparsity (float): Target sparsity level (0-1)
+            
+        Returns:
+            torch.Tensor: Sparsified state tensor
+        """
+        # Calculate sparsity mask
+        sparsity_scores = self.sparsity_gate(state.mean(dim=1, keepdim=True))
+        threshold = torch.quantile(sparsity_scores, target_sparsity)
+        mask = (sparsity_scores >= threshold).float()
+        
+        # Apply mask
+        return state * mask
+    
+    def forward(self, q, k, v, attn_mask=None, key_padding_mask=None, is_superposition=False, 
+                target_sparsity=None, apply_sparsity=False):
         """
         양자 영감 어텐션 순전파
         
@@ -245,11 +273,19 @@ class QuantumInspiredAttention(nn.Module):
             attn_mask (torch.Tensor, optional): 어텐션 마스크
             key_padding_mask (torch.Tensor, optional): 키 패딩 마스크
             is_superposition (bool): 중첩 상태 사용 여부
+            target_sparsity (float, optional): Target sparsity level
+            apply_sparsity (bool): Whether to apply sparsity
             
         Returns:
             torch.Tensor: 어텐션 결과
         """
         if is_superposition:
-            return self.forward_superposition(q, k, v, attn_mask, key_padding_mask)
+            output = self.forward_superposition(q, k, v, attn_mask, key_padding_mask)
         else:
-            return self.forward_deterministic(q, k, v, attn_mask, key_padding_mask)
+            output = self.forward_deterministic(q, k, v, attn_mask, key_padding_mask)
+            
+        # Apply sparsity if requested
+        if apply_sparsity and target_sparsity is not None:
+            output = self.apply_sparsity(output, target_sparsity)
+            
+        return output

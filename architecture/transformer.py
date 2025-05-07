@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Tuple, Union
 
 from ..core.dual_state import DualStateRepresentation, DualStateController
 from ..core.state_management import GlobalStateManager, HierarchicalStateProtocol
-from ..core.collapse import StateCollapseFramework, DynamicCollapseController
+from ..core.collapse import StateCollapseFramework, DynamicCollapseController, CollapseGate
 from ..core.inference_engine import InferenceEngine, ReasoningDepthAdapter, MultiHypothesisTracker
 from .attention import QuantumInspiredAttention
 
@@ -25,7 +25,8 @@ class QuantumInspiredTransformerEncoder(nn.Module):
         dim_feedforward: int = 3072,
         dropout: float = 0.1,
         max_superposition_dim: int = 4,
-        activation: str = "gelu"
+        activation: str = "gelu",
+        gate_type: str = "mlp"  # "mlp" 또는 "transformer"
     ):
         """
         양자 영감 트랜스포머 인코더 초기화
@@ -38,6 +39,7 @@ class QuantumInspiredTransformerEncoder(nn.Module):
             dropout (float): 드롭아웃 비율
             max_superposition_dim (int): 최대 중첩 상태 차원
             activation (str): 활성화 함수 유형
+            gate_type (str): CollapseGate 유형
         """
         super().__init__()
         
@@ -45,6 +47,7 @@ class QuantumInspiredTransformerEncoder(nn.Module):
         self.nhead = nhead
         self.num_layers = num_layers
         self.max_superposition_dim = max_superposition_dim
+        self.gate_type = gate_type
         
         # 이중 상태 표현 시스템
         self.dual_state_system = DualStateRepresentation(
@@ -63,8 +66,11 @@ class QuantumInspiredTransformerEncoder(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 max_superposition_dim=max_superposition_dim,
-                activation=activation
-            ) for _ in range(num_layers)
+                activation=activation,
+                layer_id=i,  # 레이어 ID 추가
+                num_layers=num_layers,  # 총 레이어 수 추가
+                gate_type=gate_type  # CollapseGate 유형 추가
+            ) for i in range(num_layers)
         ])
         
         # 글로벌 상태 관리 엔진
@@ -124,7 +130,8 @@ class QuantumInspiredTransformerEncoder(nn.Module):
         src_key_padding_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         return_all_states: bool = False,
-        force_collapse: bool = False
+        force_collapse: bool = False,
+        p_target: float = 0.5  # 목표 전환 확률 추가
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         양자 영감 트랜스포머 인코더 순전파
@@ -136,6 +143,7 @@ class QuantumInspiredTransformerEncoder(nn.Module):
             context (torch.Tensor, optional): 컨텍스트 정보
             return_all_states (bool): 모든 상태 반환 여부
             force_collapse (bool): 강제 상태 붕괴 여부
+            p_target (float): 목표 전환 확률
             
         Returns:
             Union[torch.Tensor, Dict[str, torch.Tensor]]: 인코딩 결과
@@ -161,6 +169,11 @@ class QuantumInspiredTransformerEncoder(nn.Module):
         previous_state = superposition_state.clone()
         hidden_state = torch.zeros(batch_size, seq_len, self.d_model, device=src.device)
         
+        # 레이어별 불확실성, 전환 확률, 리소스 효율성 저장
+        uncertainties = []
+        transition_probs = []
+        resource_efficiencies = []
+        
         # 순차적으로 레이어 처리
         for i, layer in enumerate(self.layers):
             # 레이어 결과 계산
@@ -172,12 +185,25 @@ class QuantumInspiredTransformerEncoder(nn.Module):
                 context=context,
                 superposition_degree=superposition_degree,
                 collapse_threshold=collapse_threshold,
-                interference_strength=interference_strength
+                interference_strength=interference_strength,
+                p_target=p_target  # 목표 전환 확률 전달
             )
             
             # 레이어 결과 업데이트
             deterministic_state = layer_result['deterministic_state']
             superposition_state = layer_result['superposition_state']
+            
+            # 불확실성 정보 저장
+            if 'uncertainty' in layer_result:
+                uncertainties.append(layer_result['uncertainty'])
+            
+            # 전환 확률 정보 저장
+            if 'transition_prob' in layer_result:
+                transition_probs.append(layer_result['transition_prob'])
+                
+            # 리소스 효율성 정보 저장
+            if 'resource_efficiency' in layer_result:
+                resource_efficiencies.append(layer_result.get('resource_efficiency', torch.tensor(0.0)))
             
             # 레이어 상태 저장
             layer_deterministic_states.append(deterministic_state)
@@ -191,7 +217,10 @@ class QuantumInspiredTransformerEncoder(nn.Module):
                     context=context,
                     previous_state=previous_state,
                     hidden_state=hidden_state,
-                    force_collapse=False  # 중간 레이어는 조건부 붕괴
+                    force_collapse=False,  # 중간 레이어는 조건부 붕괴
+                    layer_id=i,            # 레이어 ID 전달
+                    num_layers=self.num_layers,  # 총 레이어 수 전달
+                    p_target=p_target      # 목표 전환 확률 전달
                 )
                 
                 # 붕괴 조건이 충족된 위치만 업데이트
@@ -222,7 +251,8 @@ class QuantumInspiredTransformerEncoder(nn.Module):
             collapse_result = self.collapse_controller(
                 superposition_state=hierarchical_state,
                 deterministic_state=layer_deterministic_states[-1],
-                context=context
+                context=context,
+                p_target=p_target  # 목표 전환 확률 전달
             )
             final_deterministic = collapse_result['collapsed_state']
         else:
@@ -232,7 +262,10 @@ class QuantumInspiredTransformerEncoder(nn.Module):
                 context=context,
                 previous_state=previous_state,
                 hidden_state=hidden_state,
-                force_collapse=True  # 마지막 레이어는 강제 붕괴
+                force_collapse=True,  # 마지막 레이어는 강제 붕괴
+                layer_id=self.num_layers-1,  # 레이어 ID 전달
+                num_layers=self.num_layers,  # 총 레이어 수 전달
+                p_target=p_target  # 목표 전환 확률 전달
             )
             final_deterministic = collapse_result['collapsed_state']
         
@@ -253,6 +286,14 @@ class QuantumInspiredTransformerEncoder(nn.Module):
         )
         
         if return_all_states:
+            # 평균 불확실성, 전환 확률, 리소스 효율성 계산
+            avg_uncertainty = torch.cat(uncertainties).mean() if uncertainties else torch.tensor(0.0)
+            avg_transition_prob = torch.cat(transition_probs).mean() if transition_probs else torch.tensor(0.0)
+            avg_resource_efficiency = torch.tensor(
+                sum([eff.item() for eff in resource_efficiencies]) / len(resource_efficiencies)
+                if resource_efficiencies else 0.0
+            )
+            
             return {
                 'output': output,
                 'inference_result': inference_result['result'],
@@ -260,7 +301,11 @@ class QuantumInspiredTransformerEncoder(nn.Module):
                 'deterministic_states': layer_deterministic_states,
                 'superposition_states': managed_superposition_states,
                 'collapse_result': collapse_result,
-                'hypothesis': hypothesis_result['combined_hypothesis']
+                'hypothesis': hypothesis_result['combined_hypothesis'],
+                'uncertainty': avg_uncertainty,  # 평균 불확실성 추가
+                'transition_prob': avg_transition_prob,  # 평균 전환 확률 추가
+                'resource_efficiency': avg_resource_efficiency,  # 평균 리소스 효율성 추가
+                'gate_result': collapse_result.get('gate_result', {})  # CollapseGate 결과 추가
             }
         else:
             return output
@@ -279,7 +324,8 @@ class QuantumInspiredTransformerDecoder(nn.Module):
         dim_feedforward: int = 3072,
         dropout: float = 0.1,
         max_superposition_dim: int = 4,
-        activation: str = "gelu"
+        activation: str = "gelu",
+        gate_type: str = "mlp"  # "mlp" 또는 "transformer"
     ):
         """
         양자 영감 트랜스포머 디코더 초기화
@@ -292,6 +338,7 @@ class QuantumInspiredTransformerDecoder(nn.Module):
             dropout (float): 드롭아웃 비율
             max_superposition_dim (int): 최대 중첩 상태 차원
             activation (str): 활성화 함수 유형
+            gate_type (str): CollapseGate 유형
         """
         super().__init__()
         
@@ -299,6 +346,7 @@ class QuantumInspiredTransformerDecoder(nn.Module):
         self.nhead = nhead
         self.num_layers = num_layers
         self.max_superposition_dim = max_superposition_dim
+        self.gate_type = gate_type
         
         # 이중 상태 표현 시스템
         self.dual_state_system = DualStateRepresentation(
@@ -317,8 +365,11 @@ class QuantumInspiredTransformerDecoder(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 max_superposition_dim=max_superposition_dim,
-                activation=activation
-            ) for _ in range(num_layers)
+                activation=activation,
+                layer_id=i,  # 레이어 ID 추가
+                num_layers=num_layers,  # 총 레이어 수 추가
+                gate_type=gate_type  # CollapseGate 유형 추가
+            ) for i in range(num_layers)
         ])
         
         # 글로벌 상태 관리 엔진
@@ -374,7 +425,8 @@ class QuantumInspiredTransformerDecoder(nn.Module):
         context: Optional[torch.Tensor] = None,
         memory_superposition: Optional[torch.Tensor] = None,
         return_all_states: bool = False,
-        force_collapse: bool = False
+        force_collapse: bool = False,
+        p_target: float = 0.5  # 목표 전환 확률 추가
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         양자 영감 트랜스포머 디코더 순전파
@@ -390,6 +442,7 @@ class QuantumInspiredTransformerDecoder(nn.Module):
             memory_superposition (torch.Tensor, optional): 인코더 중첩 상태
             return_all_states (bool): 모든 상태 반환 여부
             force_collapse (bool): 강제 상태 붕괴 여부
+            p_target (float): 목표 전환 확률
             
         Returns:
             Union[torch.Tensor, Dict[str, torch.Tensor]]: 디코딩 결과
@@ -417,6 +470,11 @@ class QuantumInspiredTransformerDecoder(nn.Module):
         previous_state = superposition_state.clone()
         hidden_state = torch.zeros(batch_size, seq_len, self.d_model, device=tgt.device)
         
+        # 레이어별 불확실성, 전환 확률, 리소스 효율성 저장
+        uncertainties = []
+        transition_probs = []
+        resource_efficiencies = []
+        
         # 순차적으로 레이어 처리
         for i, layer in enumerate(self.layers):
             # 레이어 결과 계산
@@ -432,12 +490,25 @@ class QuantumInspiredTransformerDecoder(nn.Module):
                 context=context,
                 superposition_degree=superposition_degree,
                 collapse_threshold=collapse_threshold,
-                interference_strength=interference_strength
+                interference_strength=interference_strength,
+                p_target=p_target  # 목표 전환 확률 전달
             )
             
             # 레이어 결과 업데이트
             deterministic_state = layer_result['deterministic_state']
             superposition_state = layer_result['superposition_state']
+            
+            # 불확실성 정보 저장
+            if 'uncertainty' in layer_result:
+                uncertainties.append(layer_result['uncertainty'])
+            
+            # 전환 확률 정보 저장
+            if 'transition_prob' in layer_result:
+                transition_probs.append(layer_result['transition_prob'])
+                
+            # 리소스 효율성 정보 저장
+            if 'resource_efficiency' in layer_result:
+                resource_efficiencies.append(layer_result.get('resource_efficiency', torch.tensor(0.0)))
             
             # 레이어 상태 저장
             layer_deterministic_states.append(deterministic_state)
@@ -451,7 +522,10 @@ class QuantumInspiredTransformerDecoder(nn.Module):
                     context=context,
                     previous_state=previous_state,
                     hidden_state=hidden_state,
-                    force_collapse=False  # 중간 레이어는 조건부 붕괴
+                    force_collapse=False,  # 중간 레이어는 조건부 붕괴
+                    layer_id=i,            # 레이어 ID 전달
+                    num_layers=self.num_layers,  # 총 레이어 수 전달
+                    p_target=p_target      # 목표 전환 확률 전달
                 )
                 
                 # 붕괴 조건이 충족된 위치만 업데이트
@@ -482,7 +556,8 @@ class QuantumInspiredTransformerDecoder(nn.Module):
             collapse_result = self.collapse_controller(
                 superposition_state=hierarchical_state,
                 deterministic_state=layer_deterministic_states[-1],
-                context=context
+                context=context,
+                p_target=p_target  # 목표 전환 확률 전달
             )
             final_deterministic = collapse_result['collapsed_state']
         else:
@@ -492,7 +567,10 @@ class QuantumInspiredTransformerDecoder(nn.Module):
                 context=context,
                 previous_state=previous_state,
                 hidden_state=hidden_state,
-                force_collapse=True  # 마지막 레이어는 강제 붕괴
+                force_collapse=True,  # 마지막 레이어는 강제 붕괴
+                layer_id=self.num_layers-1,  # 레이어 ID 전달
+                num_layers=self.num_layers,  # 총 레이어 수 전달
+                p_target=p_target  # 목표 전환 확률 전달
             )
             final_deterministic = collapse_result['collapsed_state']
         
@@ -503,6 +581,14 @@ class QuantumInspiredTransformerDecoder(nn.Module):
         reasoning_depth, complexity = self.reasoning_depth_adapter(context)
         
         if return_all_states:
+            # 평균 불확실성, 전환 확률, 리소스 효율성 계산
+            avg_uncertainty = torch.cat(uncertainties).mean() if uncertainties else torch.tensor(0.0)
+            avg_transition_prob = torch.cat(transition_probs).mean() if transition_probs else torch.tensor(0.0)
+            avg_resource_efficiency = torch.tensor(
+                sum([eff.item() for eff in resource_efficiencies]) / len(resource_efficiencies)
+                if resource_efficiencies else 0.0
+            )
+            
             return {
                 'output': output,
                 'superposition_state': hierarchical_state,
@@ -510,7 +596,11 @@ class QuantumInspiredTransformerDecoder(nn.Module):
                 'superposition_states': managed_superposition_states,
                 'collapse_result': collapse_result,
                 'reasoning_depth': reasoning_depth,
-                'complexity': complexity
+                'complexity': complexity,
+                'uncertainty': avg_uncertainty,  # 평균 불확실성 추가
+                'transition_prob': avg_transition_prob,  # 평균 전환 확률 추가
+                'resource_efficiency': avg_resource_efficiency,  # 평균 리소스 효율성 추가
+                'gate_result': collapse_result.get('gate_result', {})  # CollapseGate 결과 추가
             }
         else:
             return output
@@ -528,7 +618,10 @@ class QuantumInspiredEncoderLayer(nn.Module):
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
         max_superposition_dim: int = 4,
-        activation: str = "gelu"
+        activation: str = "gelu",
+        layer_id: int = 0,  # 레이어 ID 추가
+        num_layers: int = 12,  # 총 레이어 수 추가
+        gate_type: str = "mlp"  # CollapseGate 유형 추가
     ):
         """
         양자 영감 인코더 레이어 초기화
@@ -540,8 +633,14 @@ class QuantumInspiredEncoderLayer(nn.Module):
             dropout (float): 드롭아웃 비율
             max_superposition_dim (int): 최대 중첩 상태 차원
             activation (str): 활성화 함수 유형
+            layer_id (int): 현재 레이어 ID
+            num_layers (int): 총 레이어 수
+            gate_type (str): CollapseGate 유형
         """
         super().__init__()
+        
+        self.layer_id = layer_id
+        self.num_layers = num_layers
         
         # 양자 영감 멀티헤드 어텐션
         self.self_attn = QuantumInspiredAttention(
@@ -579,6 +678,15 @@ class QuantumInspiredEncoderLayer(nn.Module):
         self.dual_state_system = DualStateRepresentation(
             hidden_dim=d_model,
             max_superposition_dim=max_superposition_dim
+        )
+        
+        # CollapseGate 추가
+        self.collapse_gate = CollapseGate(
+            hidden_dim=d_model,
+            max_superposition_dim=max_superposition_dim,
+            layer_id=layer_id,
+            num_layers=num_layers,
+            gate_type=gate_type
         )
         
     def _get_activation_fn(self, activation):
@@ -688,7 +796,8 @@ class QuantumInspiredEncoderLayer(nn.Module):
         context: Optional[torch.Tensor] = None,
         superposition_degree: Optional[torch.Tensor] = None,
         collapse_threshold: Optional[torch.Tensor] = None,
-        interference_strength: Optional[torch.Tensor] = None
+        interference_strength: Optional[torch.Tensor] = None,
+        p_target: float = 0.5  # 목표 전환 확률 추가
     ) -> Dict[str, torch.Tensor]:
         """
         인코더 레이어 순전파
@@ -702,6 +811,7 @@ class QuantumInspiredEncoderLayer(nn.Module):
             superposition_degree (torch.Tensor, optional): 중첩 정도
             collapse_threshold (torch.Tensor, optional): 붕괴 임계값
             interference_strength (torch.Tensor, optional): 간섭 강도
+            p_target (float): 목표 전환 확률
             
         Returns:
             Dict[str, torch.Tensor]: 인코더 레이어 결과
@@ -723,9 +833,21 @@ class QuantumInspiredEncoderLayer(nn.Module):
         # 상태 간 간섭 적용
         superposition_output = self.dual_state_system.compute_interference(superposition_output)
         
+        # CollapseGate 적용
+        gate_result = self.collapse_gate(
+            deterministic_state=deterministic_output,
+            superposition_state=superposition_output,
+            context=context,
+            p_target=p_target
+        )
+        
+        # 최종 결과 반환
         return {
-            'deterministic_state': deterministic_output,
-            'superposition_state': superposition_output
+            'deterministic_state': gate_result['deterministic_state'],
+            'superposition_state': gate_result['superposition_state'],
+            'uncertainty': gate_result['uncertainty'],
+            'transition_prob': gate_result['transition_prob'],
+            'resource_efficiency': gate_result['resource_efficiency']
         }
 
 
@@ -741,7 +863,10 @@ class QuantumInspiredDecoderLayer(nn.Module):
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
         max_superposition_dim: int = 4,
-        activation: str = "gelu"
+        activation: str = "gelu",
+        layer_id: int = 0,  # 레이어 ID 추가
+        num_layers: int = 12,  # 총 레이어 수 추가
+        gate_type: str = "mlp"  # CollapseGate 유형 추가
     ):
         """
         양자 영감 디코더 레이어 초기화
@@ -753,8 +878,14 @@ class QuantumInspiredDecoderLayer(nn.Module):
             dropout (float): 드롭아웃 비율
             max_superposition_dim (int): 최대 중첩 상태 차원
             activation (str): 활성화 함수 유형
+            layer_id (int): 현재 레이어 ID
+            num_layers (int): 총 레이어 수
+            gate_type (str): CollapseGate 유형
         """
         super().__init__()
+        
+        self.layer_id = layer_id
+        self.num_layers = num_layers
         
         # 양자 영감 멀티헤드 어텐션 (셀프 어텐션)
         self.self_attn = QuantumInspiredAttention(
@@ -802,6 +933,15 @@ class QuantumInspiredDecoderLayer(nn.Module):
         self.dual_state_system = DualStateRepresentation(
             hidden_dim=d_model,
             max_superposition_dim=max_superposition_dim
+        )
+        
+        # CollapseGate 추가
+        self.collapse_gate = CollapseGate(
+            hidden_dim=d_model,
+            max_superposition_dim=max_superposition_dim,
+            layer_id=layer_id,
+            num_layers=num_layers,
+            gate_type=gate_type
         )
         
     def _get_activation_fn(self, activation):
@@ -954,7 +1094,8 @@ class QuantumInspiredDecoderLayer(nn.Module):
         context: Optional[torch.Tensor] = None,
         superposition_degree: Optional[torch.Tensor] = None,
         collapse_threshold: Optional[torch.Tensor] = None,
-        interference_strength: Optional[torch.Tensor] = None
+        interference_strength: Optional[torch.Tensor] = None,
+        p_target: float = 0.5  # 목표 전환 확률 추가
     ) -> Dict[str, torch.Tensor]:
         """
         디코더 레이어 순전파
@@ -972,6 +1113,7 @@ class QuantumInspiredDecoderLayer(nn.Module):
             superposition_degree (torch.Tensor, optional): 중첩 정도
             collapse_threshold (torch.Tensor, optional): 붕괴 임계값
             interference_strength (torch.Tensor, optional): 간섭 강도
+            p_target (float): 목표 전환 확률
             
         Returns:
             Dict[str, torch.Tensor]: 디코더 레이어 결과
@@ -1006,9 +1148,21 @@ class QuantumInspiredDecoderLayer(nn.Module):
         # 상태 간 간섭 적용
         superposition_output = self.dual_state_system.compute_interference(superposition_output)
         
+        # CollapseGate 적용
+        gate_result = self.collapse_gate(
+            deterministic_state=deterministic_output,
+            superposition_state=superposition_output,
+            context=context,
+            p_target=p_target
+        )
+        
+        # 최종 결과 반환
         return {
-            'deterministic_state': deterministic_output,
-            'superposition_state': superposition_output
+            'deterministic_state': gate_result['deterministic_state'],
+            'superposition_state': gate_result['superposition_state'],
+            'uncertainty': gate_result['uncertainty'],
+            'transition_prob': gate_result['transition_prob'],
+            'resource_efficiency': gate_result['resource_efficiency']
         }
 
 
@@ -1027,6 +1181,7 @@ class QuantumInspiredTransformer(nn.Module):
         dropout: float = 0.1,
         max_superposition_dim: int = 4,
         activation: str = "gelu",
+        gate_type: str = "mlp",  # CollapseGate 유형 추가
         custom_encoder: Optional[nn.Module] = None,
         custom_decoder: Optional[nn.Module] = None
     ):
@@ -1042,6 +1197,7 @@ class QuantumInspiredTransformer(nn.Module):
             dropout (float): 드롭아웃 비율
             max_superposition_dim (int): 최대 중첩 상태 차원
             activation (str): 활성화 함수 유형
+            gate_type (str): CollapseGate 유형
             custom_encoder (nn.Module, optional): 사용자 정의 인코더
             custom_decoder (nn.Module, optional): 사용자 정의 디코더
         """
@@ -1050,6 +1206,7 @@ class QuantumInspiredTransformer(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
         self.max_superposition_dim = max_superposition_dim
+        self.gate_type = gate_type
         
         # 인코더 생성
         if custom_encoder is not None:
@@ -1062,7 +1219,8 @@ class QuantumInspiredTransformer(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 max_superposition_dim=max_superposition_dim,
-                activation=activation
+                activation=activation,
+                gate_type=gate_type
             )
             
         # 디코더 생성
@@ -1076,7 +1234,8 @@ class QuantumInspiredTransformer(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 max_superposition_dim=max_superposition_dim,
-                activation=activation
+                activation=activation,
+                gate_type=gate_type
             )
             
         # 초기화
@@ -1101,7 +1260,8 @@ class QuantumInspiredTransformer(nn.Module):
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
-        return_all_states: bool = False
+        return_all_states: bool = False,
+        p_target: float = 0.5  # 목표 전환 확률 추가
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         양자 영감 트랜스포머 순전파
@@ -1117,6 +1277,7 @@ class QuantumInspiredTransformer(nn.Module):
             memory_key_padding_mask (torch.Tensor, optional): 메모리 패딩 마스크
             context (torch.Tensor, optional): 컨텍스트 정보
             return_all_states (bool): 모든 상태 반환 여부
+            p_target (float): 목표 전환 확률
             
         Returns:
             Union[torch.Tensor, Dict[str, torch.Tensor]]: 트랜스포머 출력
@@ -1135,7 +1296,8 @@ class QuantumInspiredTransformer(nn.Module):
                 src_key_padding_mask=src_key_padding_mask,
                 context=context,
                 return_all_states=True,
-                force_collapse=False
+                force_collapse=False,
+                p_target=p_target  # 목표 전환 확률 전달
             )
             memory = encoder_output['output']
             memory_superposition = encoder_output['superposition_state']
@@ -1144,7 +1306,8 @@ class QuantumInspiredTransformer(nn.Module):
                 src=src,
                 mask=src_mask,
                 src_key_padding_mask=src_key_padding_mask,
-                context=context
+                context=context,
+                p_target=p_target  # 목표 전환 확률 전달
             )
             memory_superposition = None
             
@@ -1160,7 +1323,8 @@ class QuantumInspiredTransformer(nn.Module):
                 context=context,
                 memory_superposition=memory_superposition,
                 return_all_states=True,
-                force_collapse=True
+                force_collapse=True,
+                p_target=p_target  # 목표 전환 확률 전달
             )
             output = decoder_output['output']
         else:
@@ -1172,14 +1336,31 @@ class QuantumInspiredTransformer(nn.Module):
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
                 context=context,
-                memory_superposition=memory_superposition
+                memory_superposition=memory_superposition,
+                p_target=p_target  # 목표 전환 확률 전달
             )
             
         if return_all_states:
+            # 평균 불확실성, 전환 확률, 리소스 효율성 계산
+            encoder_uncertainty = encoder_output.get('uncertainty', torch.tensor(0.0))
+            decoder_uncertainty = decoder_output.get('uncertainty', torch.tensor(0.0))
+            avg_uncertainty = (encoder_uncertainty + decoder_uncertainty) / 2
+            
+            encoder_transition_prob = encoder_output.get('transition_prob', torch.tensor(0.0))
+            decoder_transition_prob = decoder_output.get('transition_prob', torch.tensor(0.0))
+            avg_transition_prob = (encoder_transition_prob + decoder_transition_prob) / 2
+            
+            encoder_resource_efficiency = encoder_output.get('resource_efficiency', torch.tensor(0.0))
+            decoder_resource_efficiency = decoder_output.get('resource_efficiency', torch.tensor(0.0))
+            avg_resource_efficiency = (encoder_resource_efficiency + decoder_resource_efficiency) / 2
+            
             return {
                 'output': output,
                 'encoder_output': encoder_output,
-                'decoder_output': decoder_output
+                'decoder_output': decoder_output,
+                'uncertainty': avg_uncertainty,  # 평균 불확실성 추가
+                'transition_prob': avg_transition_prob,  # 평균 전환 확률 추가
+                'resource_efficiency': avg_resource_efficiency  # 평균 리소스 효율성 추가
             }
         else:
             return output

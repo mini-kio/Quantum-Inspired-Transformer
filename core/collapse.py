@@ -4,6 +4,290 @@ import torch.nn.functional as F
 import math
 
 
+class CollapseGate(nn.Module):
+    """
+    토큰과 레이어별 중첩-확정 전환 비율을 학습하는 게이트 모듈
+    
+    입력 토큰 임베딩과 컨텍스트로부터 전환 확률 p를 결정하고,
+    soft/hard collapse의 비율 α를 자동으로 조절합니다.
+    """
+    
+    def __init__(
+        self, 
+        hidden_dim: int, 
+        max_superposition_dim: int = 4,
+        layer_id: int = 0,
+        num_layers: int = 12,
+        gate_type: str = "mlp",  # "mlp" 또는 "transformer"
+        alpha_learnable: bool = True
+    ):
+        """
+        CollapseGate 초기화
+        
+        Args:
+            hidden_dim: 기본 히든 차원
+            max_superposition_dim: 최대 중첩 상태 차원
+            layer_id: 현재 레이어 ID (0부터 시작)
+            num_layers: 총 레이어 수
+            gate_type: 게이트 아키텍처 유형 ("mlp" 또는 "transformer")
+            alpha_learnable: soft/hard collapse 비율 α를 학습 가능하게 할지 여부
+        """
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.max_superposition_dim = max_superposition_dim
+        self.layer_id = layer_id
+        self.num_layers = num_layers
+        self.gate_type = gate_type
+        
+        # 레이어 ID 임베딩
+        self.layer_embedding = nn.Parameter(
+            torch.zeros(1, 1, hidden_dim)
+        )
+        
+        # 레이어 ID 위치 인코딩
+        layer_pos = torch.zeros(1, 1, hidden_dim)
+        for i in range(0, hidden_dim, 2):
+            denominator = 10000 ** (2 * i / hidden_dim)
+            layer_pos[0, 0, i] = math.sin(layer_id / denominator)
+            if i + 1 < hidden_dim:
+                layer_pos[0, 0, i + 1] = math.cos(layer_id / denominator)
+        self.register_buffer('layer_pos', layer_pos)
+        
+        # 게이트 아키텍처 설정
+        if gate_type == "mlp":
+            # MLP 게이트
+            self.gate_network = nn.Sequential(
+                nn.Linear(hidden_dim * 2 + hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim // 2, 1),
+                nn.Sigmoid()
+            )
+        else:
+            # 초소형 Transformer 게이트
+            self.input_projection = nn.Linear(hidden_dim * 2 + hidden_dim, hidden_dim)
+            self.self_attn = nn.MultiheadAttention(hidden_dim, 4, dropout=0.1, batch_first=True)
+            self.ffn = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim * 2, hidden_dim)
+            )
+            self.norm1 = nn.LayerNorm(hidden_dim)
+            self.norm2 = nn.LayerNorm(hidden_dim)
+            self.output_projection = nn.Sequential(
+                nn.Linear(hidden_dim, 1),
+                nn.Sigmoid()
+            )
+        
+        # 불확실성 추정기
+        self.uncertainty_estimator = nn.Sequential(
+            nn.Linear(hidden_dim * max_superposition_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        
+        # Soft/Hard Collapse 비율 α
+        if alpha_learnable:
+            # 학습 가능한 α 파라미터 (토큰별, 레이어별로 다름)
+            self.alpha = nn.Parameter(torch.ones(1, 1, 1) * 0.5)  # 초기값 0.5
+        else:
+            # 고정된 α 값
+            self.register_buffer('alpha', torch.ones(1, 1, 1) * 0.5)
+            
+        # 가중치 초기화
+        self._init_weights()
+        
+    def _init_weights(self):
+        """가중치 초기화"""
+        # 레이어 임베딩 초기화 - 레이어 ID에 비례하는 값으로
+        with torch.no_grad():
+            self.layer_embedding.data.fill_(self.layer_id / self.num_layers)
+            
+        # 선형 레이어 초기화
+        if self.gate_type == "mlp":
+            for module in self.gate_network:
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, std=0.02)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+        else:
+            nn.init.normal_(self.input_projection.weight, std=0.02)
+            nn.init.zeros_(self.input_projection.bias)
+            
+            nn.init.normal_(self.self_attn.in_proj_weight, std=0.02)
+            nn.init.zeros_(self.self_attn.in_proj_bias)
+            nn.init.normal_(self.self_attn.out_proj.weight, std=0.02)
+            nn.init.zeros_(self.self_attn.out_proj.bias)
+            
+            for module in self.ffn:
+                if isinstance(module, nn.Linear):
+                    nn.init.normal_(module.weight, std=0.02)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                        
+            nn.init.normal_(self.output_projection[0].weight, std=0.02)
+            nn.init.zeros_(self.output_projection[0].bias)
+            
+    def estimate_uncertainty(self, superposition_state):
+        """
+        중첩 상태의 불확실성 추정
+        
+        Args:
+            superposition_state: 중첩 상태 텐서
+            
+        Returns:
+            불확실성 추정값
+        """
+        batch_size, seq_len, _ = superposition_state.shape
+        
+        # 불확실성 추정
+        return self.uncertainty_estimator(superposition_state)
+    
+    def compute_transition_probability(self, token_embeddings, context_embedding, uncertainty=None):
+        """
+        중첩-확정 전환 확률 p 계산
+        
+        Args:
+            token_embeddings: 토큰 임베딩 [batch_size, seq_len, hidden_dim]
+            context_embedding: 컨텍스트 임베딩 [batch_size, hidden_dim]
+            uncertainty: 불확실성 추정값 (선택사항)
+            
+        Returns:
+            전환 확률 p [batch_size, seq_len, 1]
+        """
+        batch_size, seq_len, _ = token_embeddings.shape
+        
+        # 컨텍스트 임베딩 확장
+        context_expanded = context_embedding.unsqueeze(1).expand(batch_size, seq_len, -1)
+        
+        # 레이어 위치 정보 확장
+        layer_info = self.layer_embedding + self.layer_pos
+        layer_info_expanded = layer_info.expand(batch_size, seq_len, -1)
+        
+        # 모든 정보 결합
+        combined_input = torch.cat([token_embeddings, context_expanded, layer_info_expanded], dim=-1)
+        
+        if self.gate_type == "mlp":
+            # MLP 게이트로 확률 계산
+            transition_prob = self.gate_network(combined_input)
+        else:
+            # Transformer 게이트로 확률 계산
+            x = self.input_projection(combined_input)
+            attn_output, _ = self.self_attn(x, x, x)
+            x = x + attn_output
+            x = self.norm1(x)
+            
+            ffn_output = self.ffn(x)
+            x = x + ffn_output
+            x = self.norm2(x)
+            
+            transition_prob = self.output_projection(x)
+        
+        # 불확실성이 제공된 경우 확률 조정
+        if uncertainty is not None:
+            # 불확실성이 높을수록 확정 전환 확률 감소
+            transition_prob = transition_prob * (1 - uncertainty * 0.5)
+            
+        return transition_prob
+    
+    def forward(self, 
+               deterministic_state, 
+               superposition_state, 
+               context=None, 
+               p_target=0.5,
+               force_collapse=False):
+        """
+        CollapseGate 순전파
+        
+        Args:
+            deterministic_state: 확정 상태 [batch_size, seq_len, hidden_dim]
+            superposition_state: 중첩 상태 [batch_size, seq_len, hidden_dim * max_superposition_dim]
+            context: 컨텍스트 임베딩 (없으면 토큰 평균)
+            p_target: 목표 전환 확률
+            force_collapse: 강제 붕괴 여부
+            
+        Returns:
+            dict: 게이트 결과
+        """
+        batch_size, seq_len, _ = deterministic_state.shape
+        
+        # 컨텍스트가 제공되지 않은 경우 토큰 평균 사용
+        if context is None:
+            context = deterministic_state.mean(dim=1)
+            
+        # 불확실성 추정
+        uncertainty = self.estimate_uncertainty(superposition_state)
+        
+        # 전환 확률 계산
+        transition_prob = self.compute_transition_probability(
+            deterministic_state, context, uncertainty
+        )
+        
+        # 강제 붕괴 시 확률 1로 설정
+        if force_collapse:
+            transition_prob = torch.ones_like(transition_prob)
+            
+        # 전환 확률에 따른 마스크 생성 (확률적 이진 마스크)
+        if self.training:
+            # 학습 중: Gumbel-Softmax 릴랙세이션 사용
+            temperature = 1.0
+            logits = torch.log(transition_prob / (1 - transition_prob + 1e-10))
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+            binary_mask = torch.sigmoid((logits + gumbel_noise) / temperature)
+        else:
+            # 추론 중: 확률적 이진 샘플링
+            binary_mask = (torch.rand_like(transition_prob) < transition_prob).float()
+            
+        # 현재 alpha 값 (토큰 및 레이어별 조정)
+        current_alpha = torch.sigmoid(self.alpha) * torch.ones_like(binary_mask)
+        
+        # 소프트 및 하드 붕괴 혼합
+        collapsed_state = torch.zeros_like(deterministic_state)
+        
+        # 중첩 상태 재구성
+        reshaped_superposition = superposition_state.view(
+            batch_size, seq_len, self.max_superposition_dim, -1
+        )
+        
+        # 소프트 붕괴: 중첩 상태의 가중 평균
+        soft_collapsed = reshaped_superposition.mean(dim=2)
+        
+        # 하드 붕괴: 확정 상태로 직접 치환
+        hard_collapsed = deterministic_state
+        
+        # alpha에 따른 소프트/하드 붕괴 혼합
+        mixed_collapsed = current_alpha * soft_collapsed + (1 - current_alpha) * hard_collapsed
+        
+        # 최종 상태: binary_mask에 따라 원래 상태와 붕괴된 상태 혼합
+        final_deterministic = (1 - binary_mask) * deterministic_state + binary_mask * mixed_collapsed
+        
+        # 중첩 상태도 부분적으로 조정
+        # binary_mask가 1인 위치(붕괴 위치)에서는 중첩 차원 간 균일화
+        binary_mask_expanded = binary_mask.unsqueeze(2).expand(-1, -1, self.max_superposition_dim, -1)
+        
+        # 균일화된 상태: 모든 중첩 차원이 동일한 값 (soft_collapsed)
+        uniform_superposition = soft_collapsed.unsqueeze(2).expand(-1, -1, self.max_superposition_dim, -1)
+        
+        # 최종 중첩 상태: 마스크에 따라 원래 중첩 상태와 균일화된 상태 혼합
+        final_superposition = (1 - binary_mask_expanded) * reshaped_superposition + binary_mask_expanded * uniform_superposition
+        final_superposition = final_superposition.reshape(batch_size, seq_len, -1)
+        
+        # 리소스 효율성 계산: 평균 전환 확률과 목표 확률 간의 차이
+        resource_efficiency = 1.0 - torch.abs(transition_prob.mean() - p_target)
+        
+        return {
+            'deterministic_state': final_deterministic,
+            'superposition_state': final_superposition,
+            'transition_prob': transition_prob,
+            'binary_mask': binary_mask,
+            'alpha': current_alpha,
+            'uncertainty': uncertainty,
+            'resource_efficiency': resource_efficiency
+        }
+
+
 class StateCollapseFramework(nn.Module):
     """
     범용 상태 붕괴 프레임워크
@@ -65,6 +349,14 @@ class StateCollapseFramework(nn.Module):
         
         # 붕괴 후 상태 정규화
         self.collapsed_norm = nn.LayerNorm(hidden_dim)
+        
+        # CollapseGate 추가 - 모든 레이어와 공유
+        self.collapse_gate = CollapseGate(
+            hidden_dim=hidden_dim,
+            max_superposition_dim=max_superposition_dim,
+            layer_id=0,  # 기본값, 나중에 각 레이어에서 덮어씀
+            num_layers=1  # 기본값, 나중에 설정
+        )
         
     def estimate_uncertainty(self, superposition_state):
         """
@@ -207,7 +499,15 @@ class StateCollapseFramework(nn.Module):
         
         return self.collapsed_norm(collapsed_state)
     
-    def forward(self, superposition_state, context, previous_state=None, hidden_state=None, force_collapse=False):
+    def forward(self, 
+                superposition_state, 
+                context, 
+                previous_state=None, 
+                hidden_state=None, 
+                force_collapse=False, 
+                layer_id=0, 
+                num_layers=12,
+                p_target=0.5):
         """
         상태 붕괴 프레임워크 순전파
         
@@ -217,6 +517,9 @@ class StateCollapseFramework(nn.Module):
             previous_state (torch.Tensor, optional): 이전 중첩 상태
             hidden_state (torch.Tensor, optional): GRU 히든 상태
             force_collapse (bool): 강제 붕괴 수행 여부
+            layer_id (int): 현재 레이어 ID
+            num_layers (int): 총 레이어 수
+            p_target (float): 목표 전환 확률
             
         Returns:
             dict: 붕괴 결과 (확정 상태, 불확실성, 붕괴 여부 등)
@@ -248,8 +551,28 @@ class StateCollapseFramework(nn.Module):
         # 붕괴 모드 선택
         mode_weights = self.select_collapse_mode(context, uncertainty)
         
+        # 확정 상태 생성
+        deterministic_state = torch.zeros(
+            batch_size, seq_len, self.hidden_dim, 
+            device=superposition_state.device
+        )
+        
+        # 레이어별 CollapseGate 설정
+        self.collapse_gate.layer_id = layer_id
+        self.collapse_gate.num_layers = num_layers
+        
+        # CollapseGate 적용
+        gate_result = self.collapse_gate(
+            deterministic_state=deterministic_state,
+            superposition_state=superposition_state,
+            context=context,
+            p_target=p_target,
+            force_collapse=force_collapse
+        )
+        
         # 조건부 붕괴 적용
         collapsed_state = torch.zeros_like(superposition_state[:, :, :self.hidden_dim])
+        
         for b in range(batch_size):
             for s in range(seq_len):
                 if collapse_condition[b, s, 0]:
@@ -258,6 +581,9 @@ class StateCollapseFramework(nn.Module):
                         superposition_state[b, s].unsqueeze(0).unsqueeze(0),
                         mode_weights[b, s].unsqueeze(0).unsqueeze(0)
                     ).squeeze(0).squeeze(0)
+                else:
+                    # CollapseGate 결과 사용
+                    collapsed_state[b, s] = gate_result['deterministic_state'][b, s]
                     
         return {
             'collapsed_state': collapsed_state,
@@ -266,7 +592,10 @@ class StateCollapseFramework(nn.Module):
             'decision_time': decision_time,
             'collapse_condition': collapse_condition,
             'mode_weights': mode_weights,
-            'hidden_state': new_hidden
+            'hidden_state': new_hidden,
+            'gate_result': gate_result,
+            'transition_prob': gate_result['transition_prob'],
+            'resource_efficiency': gate_result['resource_efficiency']
         }
 
 
@@ -318,6 +647,13 @@ class DynamicCollapseController(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim * max_superposition_dim, max_superposition_dim),
             nn.Sigmoid()
+        )
+        
+        # CollapseGate 추가
+        self.collapse_gate = CollapseGate(
+            hidden_dim=hidden_dim,
+            max_superposition_dim=max_superposition_dim,
+            gate_type="transformer"  # 더 강력한 transformer 게이트 사용
         )
         
     def estimate_task_complexity(self, context):
@@ -453,7 +789,13 @@ class DynamicCollapseController(nn.Module):
         
         return weighted_sum
     
-    def forward(self, superposition_state, deterministic_state, context, uncertainty=None):
+    def forward(
+        self, 
+        superposition_state, 
+        deterministic_state, 
+        context, 
+        uncertainty=None,
+        p_target=0.5):
         """
         동적 붕괴 컨트롤러 순전파
         
@@ -462,6 +804,7 @@ class DynamicCollapseController(nn.Module):
             deterministic_state (torch.Tensor): 확정 상태 텐서
             context (torch.Tensor): 맥락 정보
             uncertainty (torch.Tensor, optional): 불확실성 점수
+            p_target (float): 목표 전환 확률
             
         Returns:
             dict: 붕괴 결과 (붕괴된 상태, 모드 가중치 등)
@@ -495,11 +838,25 @@ class DynamicCollapseController(nn.Module):
             full_weight * full_state
         )
         
+        # CollapseGate 적용
+        gate_result = self.collapse_gate(
+            deterministic_state=deterministic_state,
+            superposition_state=superposition_state,
+            context=context,
+            p_target=p_target
+        )
+        
+        # CollapseGate의 deterministic_state와 weighted_collapsed 합치기
+        final_collapsed_state = 0.5 * gate_result['deterministic_state'] + 0.5 * collapsed_state
+        
         return {
-            'collapsed_state': collapsed_state,
+            'collapsed_state': final_collapsed_state,
             'mode_weights': mode_weights,
             'task_complexity': task_complexity,
             'gradual_state': gradual_state,
             'partial_state': partial_state,
-            'full_state': full_state
+            'full_state': full_state,
+            'gate_result': gate_result,
+            'transition_prob': gate_result['transition_prob'],
+            'resource_efficiency': gate_result['resource_efficiency']
         }

@@ -9,7 +9,7 @@ class UniversalLoss(nn.Module):
     다양한 태스크 유형에 일관되게 적용 가능한 통합 손실 함수
     """
     
-    def __init__(self, hidden_dim, task_types=None, alpha=0.5, beta=0.3, gamma=0.2):
+    def __init__(self, hidden_dim, task_types=None, alpha=0.5, beta=0.3, gamma=0.2, delta=0.2, epsilon=0.1):
         """
         통합 손실 함수 초기화
         
@@ -19,6 +19,8 @@ class UniversalLoss(nn.Module):
             alpha (float): 태스크 손실 가중치
             beta (float): 중첩 상태 정규화 가중치
             gamma (float): 일관성 손실 가중치
+            delta (float): 불확실성 보정 가중치 (새로 추가)
+            epsilon (float): 리소스 페널티 가중치 (새로 추가)
         """
         super().__init__()
         
@@ -31,6 +33,8 @@ class UniversalLoss(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        self.delta = delta  # 불확실성 보정 가중치
+        self.epsilon = epsilon  # 리소스 페널티 가중치
         
         # 태스크별 헤드
         self.task_heads = nn.ModuleDict({
@@ -59,6 +63,22 @@ class UniversalLoss(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1)
+        )
+        
+        # 불확실성 보정 모듈 (새로 추가)
+        self.uncertainty_corrector = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+        
+        # 리소스 효율성 평가기 (새로 추가)
+        self.resource_efficiency_evaluator = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
         )
         
     def compute_task_loss(self, output, target, task_type, superposition_state=None):
@@ -173,6 +193,59 @@ class UniversalLoss(nn.Module):
         
         return avg_consistency_loss
     
+    def compute_uncertainty_correction(self, deterministic_state, uncertainty, target_uncertainty=None):
+        """
+        불확실성 보정 손실 계산 (새로 추가)
+        
+        예측 분포의 엔트로피와 실제 불확실성 간의 정렬을 촉진
+        
+        Args:
+            deterministic_state (torch.Tensor): 확정 상태
+            uncertainty (torch.Tensor): 모델이 추정한 불확실성
+            target_uncertainty (torch.Tensor, optional): 목표 불확실성 (없으면 계산)
+            
+        Returns:
+            torch.Tensor: 불확실성 보정 손실
+        """
+        batch_size, seq_len, _ = deterministic_state.shape
+        
+        # 목표 불확실성이 제공되지 않은 경우, 출력 분포의 엔트로피 계산
+        if target_uncertainty is None:
+            # 확정 상태의 엔트로피 계산 (분포 다양성 지표로 사용)
+            logits = deterministic_state / deterministic_state.std(dim=-1, keepdim=True)
+            probs = F.softmax(logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1, keepdim=True)
+            
+            # 정규화된 엔트로피 (0~1)
+            max_entropy = math.log(deterministic_state.shape[-1])
+            target_uncertainty = entropy / max_entropy
+        
+        # 추정된 불확실성과 목표 불확실성 간의 MSE 손실
+        uncertainty_correction_loss = F.mse_loss(uncertainty, target_uncertainty)
+        
+        return uncertainty_correction_loss
+    
+    def compute_resource_penalty(self, transition_prob, p_target=0.5):
+        """
+        리소스 페널티 손실 계산 (새로 추가)
+        
+        평균 전환 확률이 목표 값에 가까워지도록 유도
+        
+        Args:
+            transition_prob (torch.Tensor): 중첩-확정 전환 확률
+            p_target (float): 목표 전환 확률
+            
+        Returns:
+            torch.Tensor: 리소스 페널티 손실
+        """
+        # 평균 전환 확률
+        avg_transition_prob = transition_prob.mean()
+        
+        # 목표와의 차이에 대한 페널티 (편향되지 않게 하기 위해 절대값 사용)
+        resource_penalty = torch.abs(avg_transition_prob - p_target)
+        
+        return resource_penalty
+    
     def predict_task_weights(self, context_embedding):
         """
         문맥에 따른 태스크 가중치 예측
@@ -185,7 +258,7 @@ class UniversalLoss(nn.Module):
         """
         return self.task_weight_predictor(context_embedding)
     
-    def forward(self, outputs, targets, task_type=None, context_embedding=None, **kwargs):
+    def forward(self, outputs, targets, task_type=None, context_embedding=None, p_target=0.5, **kwargs):
         """
         통합 손실 함수 순전파
         
@@ -194,6 +267,7 @@ class UniversalLoss(nn.Module):
             targets (torch.Tensor): 목표 값
             task_type (str, optional): 태스크 유형
             context_embedding (torch.Tensor, optional): 문맥 임베딩
+            p_target (float, optional): 목표 전환 확률
             **kwargs: 추가 인자
             
         Returns:
@@ -204,6 +278,8 @@ class UniversalLoss(nn.Module):
         superposition_state = outputs.get('superposition_state')
         deterministic_states = outputs.get('deterministic_states', [])
         collapsed_state = outputs.get('collapsed_state')
+        uncertainty = outputs.get('uncertainty', outputs.get('gate_result', {}).get('uncertainty'))
+        transition_prob = outputs.get('transition_prob', outputs.get('gate_result', {}).get('transition_prob'))
         
         # 태스크 가중치 예측
         if context_embedding is not None:
@@ -247,11 +323,29 @@ class UniversalLoss(nn.Module):
             deterministic_state, deterministic_states, collapsed_state
         )
         
+        # 불확실성 보정 손실 계산 (새로 추가)
+        if uncertainty is not None:
+            uncertainty_correction_loss = self.compute_uncertainty_correction(
+                deterministic_state, uncertainty
+            )
+        else:
+            uncertainty_correction_loss = torch.tensor(0.0, device=deterministic_state.device)
+            
+        # 리소스 페널티 계산 (새로 추가)
+        if transition_prob is not None:
+            resource_penalty = self.compute_resource_penalty(
+                transition_prob, p_target
+            )
+        else:
+            resource_penalty = torch.tensor(0.0, device=deterministic_state.device)
+        
         # 총 손실 계산
         total_loss = (
             self.alpha * total_task_loss +
             self.beta * superposition_reg_loss +
-            self.gamma * consistency_loss
+            self.gamma * consistency_loss +
+            self.delta * uncertainty_correction_loss +  # 새로 추가된 항목
+            self.epsilon * resource_penalty  # 새로 추가된 항목
         )
         
         return {
@@ -259,6 +353,8 @@ class UniversalLoss(nn.Module):
             'task_loss': total_task_loss,
             'superposition_reg_loss': superposition_reg_loss,
             'consistency_loss': consistency_loss,
+            'uncertainty_correction_loss': uncertainty_correction_loss,  # 새로 추가
+            'resource_penalty': resource_penalty,  # 새로 추가
             'task_losses': task_losses,
             'task_weights': task_weights
         }
@@ -312,6 +408,13 @@ class MetaLearningOptimizer(nn.Module):
             nn.Softmax(dim=-1)
         )
         
+        # CollapseGate 파라미터 조정기 (새로 추가)
+        self.collapse_gate_tuner = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 2)  # p_target, alpha
+        )
+        
     def generate_meta_parameters(self, context_embedding):
         """
         문맥에 따른 메타-파라미터 생성
@@ -347,6 +450,29 @@ class MetaLearningOptimizer(nn.Module):
             
         return weighted_pattern
     
+    def tune_collapse_gate_params(self, context_embedding):
+        """
+        문맥에 따른 CollapseGate 파라미터 조정 (새로 추가)
+        
+        Args:
+            context_embedding (torch.Tensor): 문맥 임베딩
+            
+        Returns:
+            dict: 조정된 CollapseGate 파라미터
+        """
+        params = self.collapse_gate_tuner(context_embedding)
+        
+        # p_target: [0.1, 0.9] 범위의 목표 전환 확률
+        p_target = 0.1 + 0.8 * torch.sigmoid(params[:, 0])
+        
+        # alpha: [0, 1] 범위의 soft/hard 붕괴 혼합 비율
+        alpha = torch.sigmoid(params[:, 1])
+        
+        return {
+            'p_target': p_target,
+            'alpha': alpha
+        }
+    
     def meta_optimization_step(self, inputs, targets, context_embedding=None, loss_fn=None):
         """
         메타-최적화 단계 수행
@@ -373,6 +499,9 @@ class MetaLearningOptimizer(nn.Module):
         
         # 최적 중첩 패턴 선택
         optimal_pattern = self.select_optimal_pattern(context_embedding)
+        
+        # CollapseGate 파라미터 조정
+        collapse_gate_params = self.tune_collapse_gate_params(context_embedding)
         
         # 메타-최적화 결과 저장
         meta_results = {
@@ -401,9 +530,15 @@ class MetaLearningOptimizer(nn.Module):
                 if 'dual_state' in name or 'superposition' in name:
                     # 중첩 관련 파라미터에 영향
                     param.data = param.data + 0.01 * torch.einsum('bh,...->b...', optimal_pattern, param.data)
+                elif 'collapse_gate' in name and 'alpha' in name:
+                    # alpha 파라미터 조정
+                    param.data = collapse_gate_params['alpha'].view(param.shape)
+            
+            # 추가 입력 파라미터
+            p_target = collapse_gate_params['p_target'].mean().item()
             
             # 임시 모델로 추론
-            temp_outputs = temp_model(inputs, context=meta_params)
+            temp_outputs = temp_model(inputs, context=meta_params, p_target=p_target)
             
             # 손실 계산
             if isinstance(temp_outputs, dict):
@@ -427,7 +562,8 @@ class MetaLearningOptimizer(nn.Module):
         return {
             'meta_results': meta_results,
             'optimal_pattern': optimal_pattern,
-            'final_meta_params': meta_params
+            'final_meta_params': meta_params,
+            'collapse_gate_params': collapse_gate_params
         }
     
     def forward(self, inputs, targets, context_embedding=None, loss_fn=None, apply_optimization=True):
@@ -453,18 +589,26 @@ class MetaLearningOptimizer(nn.Module):
             # 최적화 결과를 실제 모델에 적용
             optimal_pattern = meta_optimization['optimal_pattern']
             meta_params = meta_optimization['final_meta_params']
+            collapse_gate_params = meta_optimization['collapse_gate_params']
             
             # 모델의 중첩 관련 파라미터 업데이트
             for name, param in self.model.named_parameters():
                 if 'dual_state' in name or 'superposition' in name:
                     param.data = param.data + 0.001 * torch.einsum('bh,...->b...', optimal_pattern, param.data)
+                elif 'collapse_gate' in name and 'alpha' in name:
+                    # alpha 파라미터 조정
+                    param.data = collapse_gate_params['alpha'].view(param.shape)
+            
+            # p_target 계산
+            p_target = collapse_gate_params['p_target'].mean().item()
                     
             # 최적화된 모델로 추론
-            optimized_outputs = self.model(inputs, context=meta_params)
+            optimized_outputs = self.model(inputs, context=meta_params, p_target=p_target)
             
             return {
                 'meta_optimization': meta_optimization,
-                'optimized_outputs': optimized_outputs
+                'optimized_outputs': optimized_outputs,
+                'p_target': p_target
             }
         else:
             return {
