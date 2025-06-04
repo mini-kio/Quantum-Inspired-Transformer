@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from .attention import QuantumInspiredAttention
 from .feed_forward import DualStateFeedForward
-from ..core.collapse import CollapseGate
+from core.collapse import CollapseGate
 
 
 class IntegratedTransformerLayer(nn.Module):

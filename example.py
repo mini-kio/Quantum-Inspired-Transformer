@@ -4,6 +4,10 @@ import argparse
 import os
 import json
 import logging
+import sys
+
+# Ensure local modules can be imported when running as a script
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from typing import Dict, Any, Optional, List
 
 # Import the necessary modules from our project
@@ -275,7 +279,7 @@ def create_curriculum_dataloaders(
         curriculum_dataloaders = {
             "easy": torch.utils.data.DataLoader(
                 easy_dataset,
-                batch_size=batch_size // 2,
+                batch_size=max(1, batch_size // 2),
                 shuffle=True,
                 num_workers=num_workers
             ),
@@ -410,8 +414,6 @@ def main():
         curriculum_epochs=args.curriculum_epochs,
         curriculum_difficulties=args.curriculum_difficulties,
         
-        # NEW: Learnable collapse scheduler
-        use_learnable_collapse=args.use_learnable_collapse,
         
         # Training parameters
         learning_rate=args.learning_rate,
@@ -424,7 +426,6 @@ def main():
         use_meta_learning=args.use_meta_learning,
         
         # Other parameters
-        task_type=args.task_type,
         fp16=args.fp16,
         gradient_checkpointing=False
     )
@@ -435,7 +436,6 @@ def main():
         model=model,
         train_dataloader=train_dataloader if not args.use_curriculum else None,
         val_dataloader=val_dataloader,
-        curriculum_dataloaders=curriculum_dataloaders if args.use_curriculum else None,
         hparams=hparams.to_dict(),
         output_dir=args.output_dir,
         device=args.device,

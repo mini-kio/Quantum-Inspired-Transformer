@@ -5,10 +5,10 @@ import math
 import copy
 from typing import Optional, List, Dict, Tuple, Union, Any
 
-from ..core.dual_state import DualStateRepresentation, DualStateController
-from ..core.state_management import GlobalStateManager, HierarchicalStateProtocol
-from ..core.collapse import StateCollapseFramework, DynamicCollapseController, CollapseGate
-from ..core.inference_engine import InferenceEngine, ReasoningDepthAdapter, MultiHypothesisTracker
+from core.dual_state import DualStateRepresentation, DualStateController
+from core.state_management import GlobalStateManager, HierarchicalStateProtocol
+from core.collapse import StateCollapseFramework, DynamicCollapseController, CollapseGate
+from core.inference_engine import InferenceEngine, ReasoningDepthAdapter, MultiHypothesisTracker
 from .attention import QuantumInspiredAttention
 from .position_encoding import PositionalEncoding, QuantumPositionalEncoding
 from .feed_forward import FeedForward, DualStateFeedForward
