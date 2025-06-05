@@ -776,6 +776,24 @@ class ScalableModelInterface:
         # 사용자 정의 구성이 있으면 병합
         if custom_config:
             model_config.update(custom_config)
+
+        # Only keep parameters accepted by QuantumInspiredTransformer
+        allowed_keys = {
+            'd_model',
+            'nhead',
+            'num_encoder_layers',
+            'num_decoder_layers',
+            'dim_feedforward',
+            'dropout',
+            'max_superposition_dim',
+            'activation',
+            'gate_type',
+            'custom_encoder',
+            'custom_decoder',
+            'vocab_size',
+            'pad_token_id',
+        }
+        model_config = {k: v for k, v in model_config.items() if k in allowed_keys}
             
         # 공통 기본 옵션 설정
         model_config.setdefault('dropout', 0.1)

@@ -14,11 +14,11 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Callable, Union, Iterator
 
 # 프로젝트의 다른 모듈 임포트
-from ..architecture.transformer import QuantumInspiredTransformer
-from ..core.dual_state import DualStateController
-from ..optimization.learning import UniversalLoss, MetaLearningOptimizer
-from ..optimization.efficiency import ComputationalEfficiencyFramework
-from ..training.hyperparameters import HyperParameters, AdaptiveTuningScheduler, QuantumMetaScheduler, CurriculumScheduler, LearnableCollapseScheduler
+from architecture.transformer import QuantumInspiredTransformer
+from core.dual_state import DualStateController
+from optimization.learning import UniversalLoss, MetaLearningOptimizer
+from optimization.efficiency import ComputationalEfficiencyFramework
+from training.hyperparameters import HyperParameters, AdaptiveTuningScheduler, QuantumMetaScheduler, CurriculumScheduler, LearnableCollapseScheduler
 
 
 class QuantumTransformerTrainer:
@@ -997,6 +997,16 @@ class UncertaintyDatasetManager:
             shuffle=False,
             num_workers=self.num_workers
         )
+
+        # If dataset samples are not dictionaries, return uniform uncertainties
+        try:
+            sample0 = next(iter(dataloader))
+        except Exception:
+            sample0 = None
+
+        if sample0 is not None and not hasattr(sample0, 'items'):
+            self.uncertainty_scores = np.ones(len(self.dataset)) * 0.5
+            return self.uncertainty_scores
         
         # 불확실성 점수 저장소
         all_uncertainties = []
