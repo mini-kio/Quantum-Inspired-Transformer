@@ -140,7 +140,9 @@ class QuantumTransformerTester:
             
             print(f"확정 상태 입력 shape: {deterministic_input.shape}")
             
-            deterministic_output = attention.forward_deterministic(deterministic_input)
+            deterministic_output = attention.forward_deterministic(
+                deterministic_input, deterministic_input, deterministic_input
+            )
             print(f"확정 상태 출력 shape: {deterministic_output.shape}")
             
             assert deterministic_output.shape == deterministic_input.shape, \
@@ -154,7 +156,9 @@ class QuantumTransformerTester:
             
             print(f"중첩 상태 입력 shape: {superposition_input.shape}")
             
-            superposition_output = attention.forward_superposition(superposition_input)
+            superposition_output = attention.forward_superposition(
+                superposition_input, superposition_input, superposition_input
+            )
             print(f"중첩 상태 출력 shape: {superposition_output.shape}")
             
             assert superposition_output.shape == superposition_input.shape, \
@@ -303,8 +307,17 @@ class QuantumTransformerTester:
             
             print(f"입력 텐서 shape: {input_tensor.shape}")
             
-            # 레이어 통과
-            output = layer(input_tensor)
+            # 확정/중첩 상태 준비 후 레이어 통과
+            dual_state = DualStateRepresentation(
+                hidden_dim=config["d_model"], max_superposition_dim=config["max_superposition_dim"]
+            ).to(self.device)
+            superposition_state = dual_state.to_superposition_state(input_tensor)
+
+            result = layer(
+                deterministic_state=input_tensor,
+                superposition_state=superposition_state
+            )
+            output = result['deterministic_state']
             print(f"레이어 출력 shape: {output.shape}")
             
             assert output.shape == input_tensor.shape, \
@@ -365,20 +378,20 @@ class QuantumTransformerTester:
         
         try:
             # 하이퍼파라미터 설정
-            hyperparams = HyperParameters(
+            # 전체 모델 초기화 (하이퍼파라미터 -> 명시적 인자 매핑)
+            model = QuantumInspiredTransformer(
                 d_model=config["d_model"],
                 nhead=config["nhead"],
-                num_layers=config["num_layers"],
+                num_encoder_layers=config["num_layers"],
+                num_decoder_layers=config["num_layers"],
                 dim_feedforward=config["dim_feedforward"],
-                vocab_size=config["vocab_size"],
-                max_seq_len=config["max_seq_len"],
-                max_superposition_dim=config["max_superposition_dim"],
                 dropout=0.1,
-                learning_rate=1e-4
-            )
-            
-            # 전체 모델 초기화
-            model = QuantumInspiredTransformer(hyperparams).to(self.device)
+                max_superposition_dim=config["max_superposition_dim"],
+                activation='gelu',
+                gate_type='mlp',
+                vocab_size=config["vocab_size"],
+                pad_token_id=0
+            ).to(self.device)
             
             # 테스트 데이터 (토큰 ID)
             batch_size = 4
@@ -431,20 +444,20 @@ class QuantumTransformerTester:
                 print(f"초기 메모리 사용량: {initial_memory / 1024**2:.2f} MB")
             
             # 하이퍼파라미터 설정
-            hyperparams = HyperParameters(
+            # 모델 초기화 (명시적 인자)
+            model = QuantumInspiredTransformer(
                 d_model=config["d_model"],
                 nhead=config["nhead"],
-                num_layers=config["num_layers"],
+                num_encoder_layers=config["num_layers"],
+                num_decoder_layers=config["num_layers"],
                 dim_feedforward=config["dim_feedforward"],
-                vocab_size=config["vocab_size"],
-                max_seq_len=config["max_seq_len"],
-                max_superposition_dim=config["max_superposition_dim"],
                 dropout=0.1,
-                learning_rate=1e-4
-            )
-            
-            # 모델 초기화
-            model = QuantumInspiredTransformer(hyperparams).to(self.device)
+                max_superposition_dim=config["max_superposition_dim"],
+                activation='gelu',
+                gate_type='mlp',
+                vocab_size=config["vocab_size"],
+                pad_token_id=0
+            ).to(self.device)
             
             if torch.cuda.is_available():
                 model_memory = torch.cuda.memory_allocated() - initial_memory

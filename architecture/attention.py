@@ -298,7 +298,8 @@ class QuantumInspiredAttention(nn.Module):
         dim_mask = (sparsity_scores >= threshold).float()
         
         # Reshape state for dimension-wise masking
-        reshaped_state = state.view(batch_size, seq_len, self.max_superposition_dim, self.hidden_dim)
+        # BUGFIX: self.hidden_dim 는 존재하지 않음. d_model을 사용해야 함.
+        reshaped_state = state.view(batch_size, seq_len, self.max_superposition_dim, self.d_model)
         
         # Apply mask along dimension axis
         masked_state = reshaped_state * dim_mask.unsqueeze(1).unsqueeze(-1)

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import copy
 
 
 class UniversalLoss(nn.Module):
@@ -521,9 +522,8 @@ class MetaLearningOptimizer(nn.Module):
             # 메타-파라미터 업데이트
             meta_params = meta_params + self.learning_rate * meta_update
             
-            # 임시 모델 생성 (원본 모델의 복사본)
-            temp_model = type(self.model)(**vars(self.model))
-            temp_model.load_state_dict(self.model.state_dict())
+            # 임시 모델 생성 (원본 모델의 깊은 복사)
+            temp_model = copy.deepcopy(self.model)
             
             # 임시 모델에 중첩 패턴 및 메타-파라미터 적용
             for name, param in temp_model.named_parameters():

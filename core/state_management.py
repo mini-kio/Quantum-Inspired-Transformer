@@ -28,13 +28,13 @@ class GlobalStateManager(nn.Module):
         # 레이어 간 상태 전파를 위한 게이트
         self.layer_gates = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Linear(hidden_dim * max_superposition_dim * 2, hidden_dim * max_superposition_dim),
                 nn.Sigmoid()
             ) for _ in range(num_layers - 1)
         ])
         
         # 전역 상태 메모리
-        self.global_memory = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.global_memory = nn.Parameter(torch.zeros(1, 1, hidden_dim * max_superposition_dim))
         
         # 상태 일관성 유지를 위한 모듈
         self.consistency_projection = nn.Linear(
@@ -70,7 +70,45 @@ class GlobalStateManager(nn.Module):
             gate = self.layer_gates[i](gate_input).unsqueeze(1)
             
             # 게이트를 사용하여 상태 전파
-            propagated_next = gate * current_state + (1 - gate) * next_state
+            # 차원 불일치 처리: 두 상태의 마지막 차원을 맞춘다
+            current_dim = current_state.shape[-1]
+            next_dim = next_state.shape[-1]
+
+            if current_dim == next_dim:
+                # 차원이 같으면 기존 방식 사용
+                propagated_next = gate * current_state + (1 - gate) * next_state
+            else:
+                # 차원이 다르면 더 큰 차원으로 통일
+                target_dim = max(current_dim, next_dim)
+
+                if current_dim < target_dim:
+                    # current_state를 확장 (복제하여 확장)
+                    expand_factor = target_dim // current_dim
+                    current_expanded = current_state.repeat(1, 1, expand_factor)
+                    if target_dim % current_dim != 0:
+                        # 나머지가 있으면 패딩
+                        remaining = target_dim - current_expanded.shape[-1]
+                        padding = current_state[:, :, :remaining]
+                        current_expanded = torch.cat([current_expanded, padding], dim=-1)
+                    current_for_calc = current_expanded
+                else:
+                    current_for_calc = current_state
+
+                if next_dim < target_dim:
+                    # next_state를 확장 (복제하여 확장)
+                    expand_factor = target_dim // next_dim
+                    next_expanded = next_state.repeat(1, 1, expand_factor)
+                    if target_dim % next_dim != 0:
+                        # 나머지가 있으면 패딩
+                        remaining = target_dim - next_expanded.shape[-1]
+                        padding = next_state[:, :, :remaining]
+                        next_expanded = torch.cat([next_expanded, padding], dim=-1)
+                    next_for_calc = next_expanded
+                else:
+                    next_for_calc = next_state
+
+                propagated_next = gate * current_for_calc + (1 - gate) * next_for_calc
+
             propagated_states.append(propagated_next)
             
         return propagated_states
@@ -92,22 +130,47 @@ class GlobalStateManager(nn.Module):
         
         consistent_states = []
         for state in superposition_states:
-            # 글로벌 메모리를 참조하여 일관성 유지
+            # state: [B, S, H * K]  (K = max_superposition_dim)
+            # 글로벌 메모리를 참조하여 각 중첩 차원(K)별 가중치 산출
+            reshaped = state.view(batch_size, seq_len, self.max_superposition_dim, self.hidden_dim)
+            # [B*S, K, H] @ [B*S, H, 1] -> [B*S, K, 1]
+            # global_memory를 올바른 형태로 처리
+            # global_memory의 실제 크기 확인하고 적절히 reshape
+            expected_size = self.hidden_dim * self.max_superposition_dim
+            if global_memory.numel() == expected_size:
+                # 올바른 크기인 경우
+                global_memory_flat = global_memory.view(-1)  # [H*K]
+            else:
+                # 크기가 다른 경우 초기화된 상태로 되돌림
+                global_memory_flat = torch.zeros(expected_size, device=global_memory.device, dtype=global_memory.dtype)
+                # global_memory 재초기화
+                self.global_memory.data = global_memory_flat.view(1, 1, -1)
+
+            # [H*K] -> [K, H]로 reshape
+            global_memory_reshaped = global_memory_flat.view(self.max_superposition_dim, self.hidden_dim)
+            global_memory_expanded = global_memory_reshaped.unsqueeze(0).expand(batch_size * seq_len, self.max_superposition_dim, self.hidden_dim)
+
+            # attention 계산 - [B*S, K, H] @ [B*S, H, K] -> [B*S, K, K]
             memory_attention = torch.bmm(
-                state.view(batch_size * seq_len, -1, self.hidden_dim),
-                global_memory.view(batch_size * seq_len, self.hidden_dim, 1)
-            ).view(batch_size, seq_len, -1)
-            
-            # 일관성 가중치 계산
-            consistency_weights = F.softmax(memory_attention, dim=-1)
-            
-            # 일관성 프로젝션 적용
-            consistent_state = self.consistency_projection(state)
-            consistent_state = consistent_state * consistency_weights
+                reshaped.view(batch_size * seq_len, self.max_superposition_dim, self.hidden_dim),
+                global_memory_expanded.transpose(-2, -1)  # [B*S, H, K]
+            ).view(batch_size, seq_len, self.max_superposition_dim, self.max_superposition_dim)
+
+            # 대각합을 취해서 [B, S, K] 차원으로 축소
+            memory_attention = torch.diagonal(memory_attention, dim1=-2, dim2=-1)
+            # 차원 K에 대한 소프트맥스 가중치
+            consistency_weights = F.softmax(memory_attention, dim=-1).unsqueeze(-1)  # [B, S, K, 1]
+
+            # K 차원별 게이팅 적용 후 결합
+            gated = reshaped * consistency_weights  # [B, S, K, H]
+            gated = gated.view(batch_size, seq_len, -1)  # [B, S, H*K]
+
+            # 일관성 프로젝션 및 정규화
+            consistent_state = self.consistency_projection(gated)
             consistent_state = self.norm(consistent_state)
-            
+
             consistent_states.append(consistent_state)
-            
+        
         return consistent_states
     
     def exchange_information(self, states, exchange_rate=0.1):
@@ -139,7 +202,51 @@ class GlobalStateManager(nn.Module):
             exchanged_states.append(exchanged)
             
         return exchanged_states
-    
+
+    def ensure_consistency_fixed(self, superposition_states):
+        """Model-wide consistency for superposition states.
+
+        Args:
+            superposition_states (list[Tensor]): list of [B, S, H*K] states
+
+        Returns:
+            list[Tensor]: consistent states, each [B, S, H*K]
+        """
+        batch_size, seq_len = superposition_states[0].shape[:2]
+
+        consistent_states = []
+        for state in superposition_states:
+            reshaped = state.view(batch_size, seq_len, self.max_superposition_dim, self.hidden_dim)
+
+            expected_size = self.hidden_dim * self.max_superposition_dim
+            gm_flat = self.global_memory.view(-1)
+            if gm_flat.numel() != expected_size:
+                new_mem = torch.zeros(expected_size, device=self.global_memory.device, dtype=self.global_memory.dtype)
+                self.global_memory.data = new_mem.view(1, 1, -1)
+                gm_flat = self.global_memory.view(-1)
+
+            global_memory_reshaped = gm_flat.view(self.max_superposition_dim, self.hidden_dim)
+            global_memory_expanded = global_memory_reshaped.unsqueeze(0).expand(
+                batch_size * seq_len, self.max_superposition_dim, self.hidden_dim
+            )
+
+            memory_attention = torch.bmm(
+                reshaped.view(batch_size * seq_len, self.max_superposition_dim, self.hidden_dim),
+                global_memory_expanded.transpose(-2, -1)
+            ).view(batch_size, seq_len, self.max_superposition_dim, self.max_superposition_dim)
+
+            memory_attention = torch.diagonal(memory_attention, dim1=-2, dim2=-1)
+            consistency_weights = F.softmax(memory_attention, dim=-1).unsqueeze(-1)
+
+            gated = reshaped * consistency_weights
+            gated = gated.view(batch_size, seq_len, -1)
+
+            consistent_state = self.consistency_projection(gated)
+            consistent_state = self.norm(consistent_state)
+            consistent_states.append(consistent_state)
+
+        return consistent_states
+
     def update_global_memory(self, states):
         """
         전역 상태 메모리 업데이트
@@ -168,7 +275,7 @@ class GlobalStateManager(nn.Module):
         propagated_states = self.propagate_states(layer_states)
         
         # 중첩 상태의 일관성 보장
-        consistent_states = self.ensure_consistency(propagated_states)
+        consistent_states = self.ensure_consistency_fixed(propagated_states)
         
         # 토큰 간, 레이어 간 상태 정보 교환
         exchanged_states = self.exchange_information(consistent_states)
@@ -200,7 +307,10 @@ class HierarchicalStateProtocol(nn.Module):
         self.max_superposition_dim = max_superposition_dim
         
         # 각 계층 수준의 표현 차원
-        self.level_dims = [hidden_dim * 2**(num_levels - i - 1) for i in range(num_levels)]
+        # 최상위 차원은 실제 입력 차원(hidden_dim * max_superposition_dim)과 일치해야 함
+        # 이후 각 단계에서 2배씩 축소되는 구조를 기준으로 차원을 정의
+        top_dim = hidden_dim * max_superposition_dim
+        self.level_dims = [top_dim // (2 ** i) for i in range(num_levels)]
         
         # 상향 전파 프로젝션 (하위 -> 상위)
         self.up_projections = nn.ModuleList([
@@ -222,6 +332,24 @@ class HierarchicalStateProtocol(nn.Module):
             )
             for i in range(num_levels)
         ])
+
+        # align previous accumulated state to the current combine dimension (level_dims[i])
+        # index 0 is identity (same dim), i>=1 maps from level_dims[0] -> level_dims[i]
+        self.up_prev_aligns = nn.ModuleList([
+            nn.Identity() if i == 0 else nn.Linear(self.level_dims[0], self.level_dims[i])
+            for i in range(num_levels)
+        ])
+
+        # 출력 정렬용 레벨별 프로젝션: 각 레벨 출력을 동일 목표 차원으로 매핑
+        target_total_dim = hidden_dim * max_superposition_dim
+        base_dim = target_total_dim // num_levels
+        remainder = target_total_dim - base_dim * num_levels
+        self.level_out_dims = [base_dim] * num_levels
+        self.level_out_dims[-1] += remainder  # 합이 정확히 target_total_dim이 되도록 조정
+        self.level_align = nn.ModuleList([
+            nn.Linear(self.level_dims[i], self.level_out_dims[i])
+            for i in range(num_levels)
+        ])
         
     def propagate_up(self, level_states):
         """
@@ -239,11 +367,14 @@ class HierarchicalStateProtocol(nn.Module):
             # 하위 수준 상태를 상위 수준으로 투영
             up_propagated = self.up_projections[i](level_states[i + 1])
             
-            # 게이트 계산
-            gate = self.level_gates[i](propagated_states[-1])
+            # 게이트 계산: 해당 레벨 상태를 기준으로 일관된 차원 사용
+            gate = self.level_gates[i](level_states[i])
+
+            # align accumulated state to current combine dim
+            prev_aligned = self.up_prev_aligns[i](propagated_states[-1])
             
-            # 게이트를 사용하여 상태 결합
-            combined = gate * propagated_states[-1] + (1 - gate) * up_propagated
+            # 게이트를 사용하여 상태 결합 (동일 차원)
+            combined = gate * prev_aligned + (1 - gate) * up_propagated
             propagated_states.append(combined)
             
         return propagated_states
@@ -307,13 +438,11 @@ class HierarchicalStateProtocol(nn.Module):
         # 하향 전파
         down_states = self.propagate_down(up_states)
         
-        # 모든 레벨의 정보를 통합
-        integrated_state = torch.cat([
-            F.interpolate(
-                state.transpose(1, 2), 
-                size=self.hidden_dim * self.max_superposition_dim // self.num_levels
-            ).transpose(1, 2)
-            for state in down_states
-        ], dim=-1)
-        
+        # 모든 레벨의 정보를 통합 (특징 차원 정렬 후 연결)
+        aligned = []
+        for i, state in enumerate(down_states):
+            # [B, S, level_dim] -> [B, S, level_out_dim]
+            aligned.append(self.level_align[i](state))
+        integrated_state = torch.cat(aligned, dim=-1)  # [B, S, H * K]
+
         return integrated_state

@@ -123,7 +123,7 @@ class DualStateRepresentation(nn.Module):
         interference = torch.einsum('bsih,ij->bsjh', superposition_reshaped, self.interference_weights)
         
         # 간섭을 포함한 중첩 상태 합산
-        interference = interference.view(batch_size, seq_len, self.max_superposition_dim * self.hidden_dim)
+        interference = interference.reshape(batch_size, seq_len, self.max_superposition_dim * self.hidden_dim)
         combined_state = superposition_state + 0.1 * interference
         
         # 컨텍스트 기반 알파값 예측
@@ -272,36 +272,7 @@ class DualStateRepresentation(nn.Module):
                 # 중첩 상태 간 간섭 효과 적용
                 return self.compute_interference(input_state)
                 
-    def compute_transition_probability(self, deterministic_state, superposition_state, context=None):
-        """
-        현재 상태에 기반한 전환 확률 계산
-        
-        Args:
-            deterministic_state (torch.Tensor): 확정 상태 텐서
-            superposition_state (torch.Tensor): 중첩 상태 텐서
-            context (torch.Tensor, optional): 컨텍스트 임베딩
-            
-        Returns:
-            torch.Tensor: 전환 확률 [batch_size, seq_len, 1]
-        """
-        # 불확실성 추정
-        uncertainty = self.estimate_uncertainty(superposition_state)
-        
-        # 컨텍스트 임베딩이 제공된 경우
-        if context is not None:
-            batch_size, seq_len, _ = deterministic_state.shape
-            context_expanded = context.unsqueeze(1).expand(batch_size, seq_len, -1)
-            
-            # 컨텍스트와 불확실성 결합
-            combined = torch.cat([deterministic_state, context_expanded, uncertainty], dim=-1)
-            
-            # 전환 확률 계산
-            transition_prob = self.global_controller(combined)
-        else:
-            # 간단한 불확실성 기반 전환 확률
-            transition_prob = 0.5 + 0.3 * uncertainty
-            
-        return transition_prob
+    # Removed unused method: compute_transition_probability (no references across repo)
 
 
 class DualStateController(nn.Module):

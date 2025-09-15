@@ -252,12 +252,14 @@ class QuantumInspiredTransformerEncoder(nn.Module):
                     p_target=p_target      # 목표 전환 확률 전달
                 )
                 
-                # 붕괴 조건이 충족된 위치만 업데이트
-                collapse_mask = collapse_result['collapse_condition']
-                for b in range(batch_size):
-                    for s in range(seq_len):
-                        if collapse_mask[b, s, 0]:
-                            deterministic_state[b, s] = collapse_result['collapsed_state'][b, s]
+                # 붕괴 조건이 충족된 위치만 벡터화하여 업데이트
+                collapse_mask = collapse_result['collapse_condition'].bool()  # [B,S,1]
+                mask_expanded = collapse_mask.expand(-1, -1, self.d_model)
+                deterministic_state = torch.where(
+                    mask_expanded,
+                    collapse_result['collapsed_state'],
+                    deterministic_state
+                )
                 
                 # 상태 및 히든 상태 업데이트
                 previous_state = superposition_state.clone()
@@ -583,12 +585,14 @@ class QuantumInspiredTransformerDecoder(nn.Module):
                     p_target=p_target      # 목표 전환 확률 전달
                 )
                 
-                # 붕괴 조건이 충족된 위치만 업데이트
-                collapse_mask = collapse_result['collapse_condition']
-                for b in range(batch_size):
-                    for s in range(seq_len):
-                        if collapse_mask[b, s, 0]:
-                            deterministic_state[b, s] = collapse_result['collapsed_state'][b, s]
+                # 붕괴 조건이 충족된 위치만 벡터화하여 업데이트
+                collapse_mask = collapse_result['collapse_condition'].bool()
+                mask_expanded = collapse_mask.expand(-1, -1, self.d_model)
+                deterministic_state = torch.where(
+                    mask_expanded,
+                    collapse_result['collapsed_state'],
+                    deterministic_state
+                )
                 
                 # 상태 및 히든 상태 업데이트
                 previous_state = superposition_state.clone()
@@ -821,15 +825,15 @@ class QuantumInspiredTransformer(nn.Module):
     def _prepare_inputs(
         self,
         src: torch.Tensor,
-        tgt: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tgt: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         입력 준비
-        
+
         Args:
             src: 소스 시퀀스
-            tgt: 타겟 시퀀스
-            
+            tgt: 타겟 시퀀스 (encoder-only 모드에서는 None 가능)
+
         Returns:
             Tuple: (src_emb, tgt_emb)
         """
@@ -839,21 +843,24 @@ class QuantumInspiredTransformer(nn.Module):
                 src_emb = self.embedding(src) * self.embedding_scale
             else:  # [batch_size, seq_len, d_model]
                 src_emb = src
-                
-            if tgt.dim() == 2:  # [batch_size, seq_len]
-                tgt_emb = self.embedding(tgt) * self.embedding_scale
-            else:  # [batch_size, seq_len, d_model]
-                tgt_emb = tgt
+
+            if tgt is not None:
+                if tgt.dim() == 2:  # [batch_size, seq_len]
+                    tgt_emb = self.embedding(tgt) * self.embedding_scale
+                else:  # [batch_size, seq_len, d_model]
+                    tgt_emb = tgt
+            else:
+                tgt_emb = None
         else:
             src_emb = src
             tgt_emb = tgt
-            
+
         return src_emb, tgt_emb
                 
     def forward(
         self,
         src: torch.Tensor,
-        tgt: torch.Tensor,
+        tgt: Optional[torch.Tensor] = None,
         src_mask: Optional[torch.Tensor] = None,
         tgt_mask: Optional[torch.Tensor] = None,
         memory_mask: Optional[torch.Tensor] = None,
@@ -870,10 +877,11 @@ class QuantumInspiredTransformer(nn.Module):
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         양자 영감 트랜스포머 순전파
-        
+
         Args:
             src (torch.Tensor): 소스 시퀀스 [batch_size, src_len, d_model] 또는 [batch_size, src_len]
-            tgt (torch.Tensor): 타겟 시퀀스 [batch_size, tgt_len, d_model] 또는 [batch_size, tgt_len]
+            tgt (torch.Tensor, optional): 타겟 시퀀스 [batch_size, tgt_len, d_model] 또는 [batch_size, tgt_len]
+                                         None인 경우 encoder-only 모드로 동작
             src_mask (torch.Tensor, optional): 소스 어텐션 마스크
             tgt_mask (torch.Tensor, optional): 타겟 어텐션 마스크
             memory_mask (torch.Tensor, optional): 메모리 어텐션 마스크
@@ -887,31 +895,45 @@ class QuantumInspiredTransformer(nn.Module):
             superposition_degree (float, optional): 중첩 정도 (0~1)
             collapse_threshold (float, optional): 붕괴 임계값 (0~1)
             interference_strength (float, optional): 간섭 강도 (0~1)
-            
+
         Returns:
             Union[torch.Tensor, Dict[str, torch.Tensor]]: 트랜스포머 출력
         """
+        # encoder-only 모드 체크
+        encoder_only = tgt is None
+
         # 입력 임베딩 적용
-        src_emb, tgt_emb = self._prepare_inputs(src, tgt)
-        
-        # 마스크 준비
-        if any(mask is None for mask in [src_mask, tgt_mask, src_key_padding_mask, tgt_key_padding_mask]):
-            prepared_masks = self._prepare_masks(src, tgt, src_key_padding_mask, tgt_key_padding_mask)
-            src_mask = prepared_masks[0] if src_mask is None else src_mask
-            tgt_mask = prepared_masks[1] if tgt_mask is None else tgt_mask
-            memory_mask = prepared_masks[2] if memory_mask is None else memory_mask
-            src_key_padding_mask = prepared_masks[3] if src_key_padding_mask is None else src_key_padding_mask
-            tgt_key_padding_mask = prepared_masks[4] if tgt_key_padding_mask is None else tgt_key_padding_mask
-        
-        # memory_key_padding_mask가 없으면 src_key_padding_mask 사용
-        if memory_key_padding_mask is None:
-            memory_key_padding_mask = src_key_padding_mask
-        
+        if encoder_only:
+            src_emb = self._prepare_inputs(src, src)[0]  # src만 처리
+        else:
+            src_emb, tgt_emb = self._prepare_inputs(src, tgt)
+
+        # 마스크 준비 (encoder-only인 경우 src 관련 마스크만)
+        if encoder_only:
+            if src_key_padding_mask is None and self.has_embeddings:
+                src_key_padding_mask = (src == self.pad_token_id)
+            src_mask = None
+        else:
+            if any(mask is None for mask in [src_mask, tgt_mask, src_key_padding_mask, tgt_key_padding_mask]):
+                prepared_masks = self._prepare_masks(src, tgt, src_key_padding_mask, tgt_key_padding_mask)
+                src_mask = prepared_masks[0] if src_mask is None else src_mask
+                tgt_mask = prepared_masks[1] if tgt_mask is None else tgt_mask
+                memory_mask = prepared_masks[2] if memory_mask is None else memory_mask
+                src_key_padding_mask = prepared_masks[3] if src_key_padding_mask is None else src_key_padding_mask
+                tgt_key_padding_mask = prepared_masks[4] if tgt_key_padding_mask is None else tgt_key_padding_mask
+
+            # memory_key_padding_mask가 없으면 src_key_padding_mask 사용
+            if memory_key_padding_mask is None:
+                memory_key_padding_mask = src_key_padding_mask
+
         # 컨텍스트 생성
         if context is None:
             src_context = src_emb.mean(dim=1)  # [batch_size, d_model]
-            tgt_context = tgt_emb.mean(dim=1)  # [batch_size, d_model]
-            context = (src_context + tgt_context) / 2
+            if encoder_only:
+                context = src_context
+            else:
+                tgt_context = tgt_emb.mean(dim=1)  # [batch_size, d_model]
+                context = (src_context + tgt_context) / 2
             
         # 인코더 순전파
         if return_all_states:
@@ -921,7 +943,7 @@ class QuantumInspiredTransformer(nn.Module):
                 src_key_padding_mask=src_key_padding_mask,
                 context=context,
                 return_all_states=True,
-                force_collapse=False,
+                force_collapse=encoder_only or False,  # encoder-only인 경우 force_collapse=True
                 p_target=p_target,  # 목표 전환 확률 전달
                 superposition_degree=superposition_degree,
                 collapse_threshold=collapse_threshold,
@@ -935,14 +957,29 @@ class QuantumInspiredTransformer(nn.Module):
                 mask=src_mask,
                 src_key_padding_mask=src_key_padding_mask,
                 context=context,
+                force_collapse=encoder_only or False,  # encoder-only인 경우 force_collapse=True
                 p_target=p_target,  # 목표 전환 확률 전달
                 superposition_degree=superposition_degree,
                 collapse_threshold=collapse_threshold,
                 interference_strength=interference_strength
             )
             memory_superposition = None
-            
-        # 디코더 순전파
+
+        # encoder-only 모드인 경우 여기서 반환
+        if encoder_only:
+            output = memory
+            if self.has_embeddings:
+                output = self.output_projection(output)
+
+            if return_all_states:
+                encoder_output['output'] = output
+                if self.has_embeddings:
+                    encoder_output['logits'] = output
+                return encoder_output
+            else:
+                return output
+
+        # 디코더 순전파 (encoder-decoder 모드)
         if return_all_states:
             decoder_output = self.decoder(
                 tgt=tgt_emb,

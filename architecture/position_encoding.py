@@ -99,27 +99,33 @@ class QuantumPositionalEncoding(nn.Module):
         Returns:
             위치 인코딩이 적용된 텐서
         """
-        if not is_superposition:
-            # 확정 상태: 표준 위치 인코딩 적용
-            x = x + self.pe[:, :x.size(1), :]
-            return self.dropout(x)
-        else:
+        # 입력 형태에 따라 안전하게 처리
+        batch_size, seq_len, feat = x.shape
+        
+        # 1) 이미 중첩 상태이거나 명시적으로 요청된 경우
+        if is_superposition or feat == self.d_model * self.max_superposition_dim:
             # 중첩 상태: 각 중첩 차원에 다른 위상의 위치 인코딩 적용
-            batch_size, seq_len, _ = x.shape
-            
-            # 중첩 상태 재구성
             reshaped = x.view(batch_size, seq_len, self.max_superposition_dim, self.d_model)
-            
-            # 각 중첩 차원에 위치 인코딩 적용
             for dim in range(self.max_superposition_dim):
-                # 위상 시프트된 위치 인코딩 계산
                 phase_shift = self.phase_shifts[dim]
-                phase_pe = self.pe[:, :seq_len, :] * torch.cos(phase_shift) + self.pe[:, :seq_len, :].roll(shifts=1, dims=2) * torch.sin(phase_shift)
-                
-                # 해당 차원에 적용
+                phase_pe = (
+                    self.pe[:, :seq_len, :] * torch.cos(phase_shift)
+                    + self.pe[:, :seq_len, :].roll(shifts=1, dims=2) * torch.sin(phase_shift)
+                )
                 reshaped[:, :, dim, :] = reshaped[:, :, dim, :] + phase_pe
-            
-            # 원래 형태로 복원
-            encoded = reshaped.view(batch_size, seq_len, -1)
-            
+            encoded = reshaped.reshape(batch_size, seq_len, -1)
             return self.dropout(encoded)
+        
+        # 2) 확정 상태가 들어왔지만, 슈퍼포지션 확장을 원하는 경우(테스트/호환성용)
+        #    d_model -> d_model * max_superposition_dim 으로 확장 후 위상 인코딩 적용
+        base = x + self.pe[:, :seq_len, :]
+        expanded = base.unsqueeze(2).expand(batch_size, seq_len, self.max_superposition_dim, self.d_model)
+        for dim in range(self.max_superposition_dim):
+            phase_shift = self.phase_shifts[dim]
+            phase_pe = (
+                self.pe[:, :seq_len, :] * torch.cos(phase_shift)
+                + self.pe[:, :seq_len, :].roll(shifts=1, dims=2) * torch.sin(phase_shift)
+            )
+            expanded[:, :, dim, :] = expanded[:, :, dim, :] + phase_pe
+        encoded = expanded.reshape(batch_size, seq_len, -1)
+        return self.dropout(encoded)
