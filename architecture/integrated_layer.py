@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .attention import QuantumInspiredAttention
-from .feed_forward import DualStateFeedForward
+from .feed import DualStateFeedForward
 from core.collapse import CollapseGate
 
 

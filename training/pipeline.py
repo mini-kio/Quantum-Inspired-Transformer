@@ -18,7 +18,7 @@ from architecture.transformer import QuantumInspiredTransformer
 from core.dual_state import DualStateController
 from optimization.learning import UniversalLoss, MetaLearningOptimizer
 from optimization.efficiency import ComputationalEfficiencyFramework
-from training.hyperparameters import HyperParameters, AdaptiveTuningScheduler, QuantumMetaScheduler, CurriculumScheduler, LearnableCollapseScheduler
+from training.params import HyperParameters, AdaptiveTuningScheduler, QuantumMetaScheduler, CurriculumScheduler, LearnableCollapseScheduler
 
 
 class QuantumTransformerTrainer:

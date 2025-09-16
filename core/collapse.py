@@ -328,9 +328,11 @@ class StateCollapseFramework(nn.Module):
             nn.Sigmoid()
         )
         
-        # 최적 결정 시점 예측기
+        # 최적 결정 시점 예측기 - 올바른 입력 차원 계산
+        # uncertainty: 1차원 (uncertainty_estimator 출력), context: hidden_dim
+        predictor_input_dim = 1 + hidden_dim
         self.decision_time_predictor = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(predictor_input_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
@@ -421,26 +423,26 @@ class StateCollapseFramework(nn.Module):
     def determine_optimal_decision_time(self, uncertainty, context):
         """
         전역 및 지역 불확실성을 고려한 최적 결정 시점 결정
-        
+
         Args:
             uncertainty (torch.Tensor): 불확실성 추정값
             context (torch.Tensor): 맥락 정보
-            
+
         Returns:
             torch.Tensor: 결정 시점 점수 (0에 가까울수록 즉시 붕괴)
         """
         batch_size, seq_len, _ = uncertainty.shape
-        
+
         # 맥락 확장
         if context.dim() == 2:
             context = context.unsqueeze(1).expand(batch_size, seq_len, -1)
-            
+
         # 불확실성과 맥락 결합
         combined = torch.cat([uncertainty, context], dim=-1)
-        
+
         # 결정 시점 점수 계산
         decision_time = self.decision_time_predictor(combined)
-        
+
         return decision_time
     
     def select_collapse_mode(self, context, uncertainty):
@@ -624,9 +626,11 @@ class DynamicCollapseController(nn.Module):
             nn.Sigmoid()
         )
         
-        # 모드 전환 컨트롤러
+        # 모드 전환 컨트롤러 - 올바른 입력 차원 계산
+        # context: hidden_dim, uncertainty: 1, task_complexity: 1
+        mode_input_dim = hidden_dim + 2
         self.mode_transition_controller = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 2, hidden_dim),
+            nn.Linear(mode_input_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
@@ -718,13 +722,16 @@ class DynamicCollapseController(nn.Module):
         # 점진적 붕괴 비율 계산
         collapse_rate = self.gradual_rate_controller(context)
         
-        # 확장된 확정 상태 생성
-        expanded_deterministic = torch.zeros_like(superposition_state)
-        expanded_deterministic[:, :, :self.hidden_dim] = deterministic_state
-        
+        # 중첩 상태에서 확정 상태 추출 (평균 취하기)
+        batch_size, seq_len, _ = superposition_state.shape
+        reshaped = superposition_state.view(
+            batch_size, seq_len, self.max_superposition_dim, -1
+        )
+        superposition_mean = reshaped.mean(dim=2)  # [B, S, hidden_dim]
+
         # 점진적 붕괴 적용 (중첩과 확정의 가중 평균)
-        gradually_collapsed = (1 - collapse_rate) * superposition_state + collapse_rate * expanded_deterministic
-        
+        gradually_collapsed = (1 - collapse_rate) * superposition_mean + collapse_rate * deterministic_state
+
         return gradually_collapsed
     
     def partial_collapse(self, superposition_state):
@@ -756,11 +763,11 @@ class DynamicCollapseController(nn.Module):
         
         # 부분 붕괴 적용
         partially_collapsed = reshaped * (1 - expanded_mask) + masked_mean * expanded_mask
-        
-        # 형태 복원
-        partially_collapsed = partially_collapsed.view(batch_size, seq_len, -1)
-        
-        return partially_collapsed
+
+        # 확정 상태로 변환 (평균 취하기)
+        collapsed_deterministic = partially_collapsed.mean(dim=2)  # [B, S, hidden_dim]
+
+        return collapsed_deterministic
     
     def full_collapse(self, superposition_state):
         """

@@ -13,12 +13,12 @@ from typing import Dict, Any, Optional, List
 # Import the necessary modules from our project
 from architecture.transformer import QuantumInspiredTransformer
 from core.dual_state import DualStateController
-from optimization.resource_allocator import ResourceAllocator
+from optimization.resource import ResourceAllocator
 from optimization.learning import UniversalLoss, MetaLearningOptimizer
 from optimization.efficiency import ComputationalEfficiencyFramework
 from architecture.interface import QuantumInspiredInterface, ScalableModelInterface
 from architecture.scaling import ScalingLaws, AdaptiveConfigurationFramework
-from training.hyperparameters import HyperParameters, HyperParameterOptimizer
+from training.params import HyperParameters, HyperParameterOptimizer
 from training.pipeline import QuantumTransformerTrainer, UncertaintyDatasetManager
 from utils.visualization import QuantumStateVisualizer
 

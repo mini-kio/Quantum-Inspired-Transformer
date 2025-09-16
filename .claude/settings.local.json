@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(PYTHONIOENCODING=utf-8 timeout 30 python -c \"\nimport sys\nsys.path.append(''.'')\nfrom test_quantum_transformer import QuantumTransformerTester\ntester = QuantumTransformerTester()\ntry:\n    result = tester.test_transformer_encoder(''tiny'')\n    if result:\n        print(''✅ Encoder test PASSED!'')\n    else:\n        print(''❌ Encoder test FAILED but no exception'')\nexcept Exception as e:\n    print(f''❌ Encoder test ERROR: {e}'')\n\")"
-    ],
-    "deny": [],
-    "ask": []
-  }
-}
